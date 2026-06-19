@@ -1,0 +1,30 @@
+# tide 로컬 상태 파일 (.tide/deps 는 커밋 대상이므로 무시하지 않음)
+.tide/phase
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.Python
+
+# 테스트 / 커버리지
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# 에디터 / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

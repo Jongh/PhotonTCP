@@ -1,0 +1,24 @@
+[project]
+name = "photontcp"
+version = "0.1.0"
+description = "화면+카메라+애니메이션 QR 코드로 동작하는 TCP 유사 신뢰성 양방향 전송 프로토콜"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "김종현", email = "kjhfood@hotmail.com" }]
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+# 후반 단계(QR 코덱·광학 채널)에서 활성화 예정
+qr = ["segno", "qrcode"]
+optical = ["opencv-python", "pyzbar"]
+app = ["msgpack"]
+dev = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["photontcp*"]
