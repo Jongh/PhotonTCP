@@ -5,6 +5,28 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-19
+
+신뢰성 계층(로드맵 2단계). 손실·중복·순서뒤바뀜 채널 위에서 신뢰성 있는 순서 보장 전송.
+
+### Added
+
+- **신뢰성 계층** (`photontcp/reliability/`): Selective Repeat(SR) ARQ.
+- **SR ARQ 엔진** (`ArqEndpoint`): 송신 슬라이딩 윈도우 + 선택 재전송, 수신 재정렬·중복제거 버퍼, 누적 ACK + 선택 NACK, 기본 흐름 제어(상대 광고 윈도우 반영).
+- **적응형 RTO** (`RtoEstimator`): Jacobson/Karels SRTT/RTTVAR, min/max 클램프, 타임아웃 지수 백오프, Karn 규칙 RTT 샘플링.
+- **32비트 wraparound-safe 시퀀스 산술** (`serial`): RFC1982 류 시리얼 번호 비교.
+- **제어 패킷 재전송 + 수립 타임아웃**: SYN/SYN_ACK/FIN 손실 시 RTO 재전송, 재시도 한도 초과 시 `CONNECT_FAILED`/`TIMED_OUT`. 핸드셰이크 최종 ACK 손실도 복구.
+- **Session 신뢰 데이터 경로**: `Session.send(data)` / `Session.recv()` — 손실 채널에서 바이트열 무손실·순서 전달. 손실 채널 신뢰 전송 예제(`examples/reliable_loopback.py`).
+- 신뢰성 테스트 42건(serial·RTO·ARQ 엔진·신뢰성 세션 통합).
+
+### Changed
+
+- 세션 상태머신/드라이버가 제어 재전송과 ARQ 데이터 경로를 통합(M2 무손실 동작은 회귀 없이 유지).
+
+### Notes
+
+- M1 리뷰 권장(seq mod 2³²)·M2 리뷰 권장(제어 재전송·수립 타임아웃) 해소. NACK 다중 블록·반이중(half-close)·스트림 다중화·패킷 간 FEC는 후속(M4/최적화)으로 이월.
+
 ## [0.2.0] - 2026-06-19
 
 세션 계층(로드맵 1단계). M1 전송 토대 위에 연결 지향 세션 관리를 추가.

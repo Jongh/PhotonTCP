@@ -31,6 +31,31 @@ State table (lossless M2 assumption)::
     CLOSE_WAIT      recv FIN_ACK                  -> CLOSED        -             CLOSED
     (active)        tick: idle timeout            -> CLOSED        -             TIMED_OUT
 
+Control-packet retransmission (M3-T04)
+--------------------------------------
+
+The handshake (SYN/SYN_ACK/ACK) and graceful close (FIN/FIN_ACK) use control
+packets that, on a lossy link, may be dropped. To tolerate this, the machine
+remembers the last *outstanding* control packet awaiting a reply -- the SYN
+(SYN_SENT), the SYN_ACK (SYN_RCVD), or our FIN (FIN_WAIT / CLOSE_WAIT) -- along
+with the time it was sent and how many times it has been retransmitted. Each
+:meth:`on_tick` retransmits that packet once ``control_rto`` seconds have
+elapsed since the last (re)send::
+
+    pending           tick: now - sent >= control_rto, retries <= max -> resend (same)  -
+    pending           retries > max, establishment phase              -> CLOSED  CONNECT_FAILED
+    pending           retries > max, close phase                      -> CLOSED  TIMED_OUT
+
+The pending packet is cleared as soon as its reply arrives (SYN_ACK clears the
+SYN, the handshake-completing ACK clears the SYN_ACK, FIN_ACK clears our FIN)
+and whenever the session reaches ESTABLISHED or CLOSED. On a lossless link the
+reply is immediate, so the pending packet is cleared before any tick fires and
+no retransmission ever happens -- the M2 behaviour is unchanged.
+
+Retransmissions refresh ``last_send`` (so heartbeat timing stays consistent) but
+deliberately do **not** touch ``last_recv``: a peer that has gone silent must
+still eventually trip either the control-retry limit or the idle timeout.
+
 Graceful close is symmetric: a session reaches CLOSED only once *both* its own
 FIN is acked and it has acked the peer's FIN. Receiving a FIN while ESTABLISHED
 auto-sends our own FIN (alongside the FIN_ACK), so a single active close() tears
@@ -54,8 +79,10 @@ from photontcp.packet.header import Packet
 from photontcp.packet.types import Flags, PacketType
 
 from .states import (
+    DEFAULT_CONTROL_RTO,
     DEFAULT_HEARTBEAT_INTERVAL,
     DEFAULT_IDLE_TIMEOUT,
+    DEFAULT_MAX_CONTROL_RETRIES,
     SessionEvent,
     SessionState,
 )
@@ -94,6 +121,12 @@ class SessionStateMachine:
             emitted while ESTABLISHED.
         idle_timeout: Seconds without any received frame after which the session
             is declared dead (``TIMED_OUT`` + transition to ``CLOSED``).
+        control_rto: Fixed retransmission timeout (seconds) for an outstanding
+            control packet (SYN/SYN_ACK/FIN). A simple fixed RTO is used rather
+            than an adaptive estimator for the handshake/close path.
+        max_control_retries: Maximum number of control-packet retransmissions
+            before the session is aborted (``CONNECT_FAILED`` during
+            establishment, ``TIMED_OUT`` during close).
     """
 
     def __init__(
@@ -104,6 +137,8 @@ class SessionStateMachine:
         isn: int,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        control_rto: float = DEFAULT_CONTROL_RTO,
+        max_control_retries: int = DEFAULT_MAX_CONTROL_RETRIES,
     ) -> None:
         self.is_initiator = is_initiator
         self.session_id = session_id
@@ -111,6 +146,8 @@ class SessionStateMachine:
         self.seq = isn
         self.heartbeat_interval = heartbeat_interval
         self.idle_timeout = idle_timeout
+        self.control_rto = control_rto
+        self.max_control_retries = max_control_retries
 
         self._state = SessionState.CLOSED
         #: Last time a packet was sent / a frame was received. ``None`` until
@@ -125,6 +162,15 @@ class SessionStateMachine:
         #: close() drives both peers to CLOSED.
         self._fin_acked = False
         self._peer_fin_acked = False
+
+        #: Control-packet retransmission bookkeeping (M3-T04). ``_pending_ctrl``
+        #: is the last control packet (SYN/SYN_ACK/FIN) still awaiting a reply,
+        #: ``_pending_ctrl_since`` the time it was last (re)sent, and
+        #: ``_ctrl_retries`` how many times it has been retransmitted. ``None``
+        #: means nothing is outstanding, so :meth:`on_tick` never retransmits.
+        self._pending_ctrl: Packet | None = None
+        self._pending_ctrl_since: float = 0.0
+        self._ctrl_retries: int = 0
 
     # ------------------------------------------------------------------ #
     # Read-only state introspection
@@ -169,6 +215,22 @@ class SessionStateMachine:
         )
 
     # ------------------------------------------------------------------ #
+    # Control-packet retransmission bookkeeping (M3-T04)
+    # ------------------------------------------------------------------ #
+
+    def _arm_pending(self, pkt: Packet, now: float) -> None:
+        """Record ``pkt`` as the outstanding control packet awaiting a reply."""
+        self._pending_ctrl = pkt
+        self._pending_ctrl_since = now
+        self._ctrl_retries = 0
+
+    def _clear_pending(self) -> None:
+        """Drop the outstanding control packet (its reply arrived / done)."""
+        self._pending_ctrl = None
+        self._pending_ctrl_since = 0.0
+        self._ctrl_retries = 0
+
+    # ------------------------------------------------------------------ #
     # Inputs
     # ------------------------------------------------------------------ #
 
@@ -184,6 +246,7 @@ class SessionStateMachine:
         self._state = SessionState.SYN_SENT
         pkt = self._make(PacketType.SYN, seq=self.isn, ack=0, flags=Flags.SYN)
         self.last_send = now
+        self._arm_pending(pkt, now)
         return Output(packets=[pkt])
 
     def close(self, now: float) -> Output:
@@ -200,6 +263,7 @@ class SessionStateMachine:
         self._state = SessionState.FIN_WAIT
         pkt = self._make(PacketType.FIN, seq=self.seq, ack=0, flags=Flags.FIN)
         self.last_send = now
+        self._arm_pending(pkt, now)
         return Output(packets=[pkt])
 
     def on_packet(self, pkt: Packet, now: float) -> Output:
@@ -236,10 +300,13 @@ class SessionStateMachine:
                 flags=Flags.SYN | Flags.ACK,
             )
             self.last_send = now
+            self._arm_pending(reply, now)
             return Output(packets=[reply])
 
         if state is SessionState.SYN_SENT and ptype is PacketType.SYN_ACK:
-            # Initiator completes the handshake: ACK + ESTABLISHED.
+            # Initiator completes the handshake: ACK + ESTABLISHED. The SYN_ACK
+            # is the reply to our SYN -> clear the outstanding control packet.
+            self._clear_pending()
             self._state = SessionState.ESTABLISHED
             self.seq = self.isn + 1
             reply = self._make(
@@ -254,10 +321,28 @@ class SessionStateMachine:
             )
 
         if state is SessionState.SYN_RCVD and ptype is PacketType.ACK:
-            # Responder completes the handshake.
+            # Responder completes the handshake. The ACK is the reply to our
+            # SYN_ACK -> clear the outstanding control packet.
+            self._clear_pending()
             self._state = SessionState.ESTABLISHED
             self.seq = self.isn + 1
             return Output(events=[SessionEvent.ESTABLISHED])
+
+        if state is SessionState.ESTABLISHED and ptype is PacketType.SYN_ACK:
+            # Our handshake-completing ACK was lost: the responder, still in
+            # SYN_RCVD, retransmits its SYN_ACK. The ACK is the one control
+            # packet we never arm for retransmission (we move straight to
+            # ESTABLISHED), so we recover it here by re-sending the ACK in
+            # response to each duplicate SYN_ACK -- standard TCP behaviour. No
+            # state change, no duplicate ESTABLISHED event.
+            reply = self._make(
+                PacketType.ACK,
+                seq=self.seq,
+                ack=pkt.seq + 1,
+                flags=Flags.ACK,
+            )
+            self.last_send = now
+            return Output(packets=[reply])
 
         # --- Graceful close ------------------------------------------- #
         if state is SessionState.ESTABLISHED and ptype is PacketType.FIN:
@@ -276,6 +361,8 @@ class SessionStateMachine:
                 PacketType.FIN, seq=self.seq, ack=0, flags=Flags.FIN
             )
             self.last_send = now
+            # Our auto-sent FIN awaits a FIN_ACK -> track it for retransmission.
+            self._arm_pending(own_fin, now)
             return Output(
                 packets=[fin_ack, own_fin],
                 events=[SessionEvent.PEER_CLOSED],
@@ -284,6 +371,7 @@ class SessionStateMachine:
         if state is SessionState.FIN_WAIT and ptype is PacketType.FIN_ACK:
             # Our FIN was acknowledged. Close only once we've also acked the
             # peer's FIN (handled below); otherwise keep waiting for it.
+            self._clear_pending()
             self._fin_acked = True
             if self._peer_fin_acked:
                 self._state = SessionState.CLOSED
@@ -308,6 +396,7 @@ class SessionStateMachine:
         if state is SessionState.CLOSE_WAIT and ptype is PacketType.FIN_ACK:
             # Passive side: the FIN_ACK for our auto-sent FIN arrived. Both
             # directions are now torn down.
+            self._clear_pending()
             self._fin_acked = True
             self._state = SessionState.CLOSED
             return Output(events=[SessionEvent.CLOSED])
@@ -317,11 +406,19 @@ class SessionStateMachine:
         return Output()
 
     def on_tick(self, now: float) -> Output:
-        """Evaluate timers: emit heartbeats and detect idle timeout.
+        """Evaluate timers: heartbeats, idle timeout, and control retransmits.
 
         * Idle timeout (active states only): if ``now - last_recv >=
           idle_timeout`` the session is declared dead -> ``TIMED_OUT`` +
           transition to CLOSED. Checked first so a dead link never heartbeats.
+        * Control-packet retransmission (M3-T04): if a control packet is still
+          outstanding and ``now - _pending_ctrl_since >= control_rto``, the
+          retry limit is enforced first -- if ``_ctrl_retries`` already exceeds
+          ``max_control_retries`` the session is aborted (CONNECT_FAILED while
+          establishing in SYN_SENT/SYN_RCVD, otherwise TIMED_OUT) and the
+          pending packet cleared. Otherwise the packet is retransmitted,
+          ``_ctrl_retries`` is incremented, ``_pending_ctrl_since`` reset to
+          ``now``, and ``last_send`` refreshed (``last_recv`` is left untouched).
         * Heartbeat (ESTABLISHED only): if ``now - last_send >=
           heartbeat_interval`` emit a HEARTBEAT and refresh ``last_send``.
         """
@@ -334,8 +431,38 @@ class SessionStateMachine:
                 and now - self.last_recv >= self.idle_timeout
             ):
                 self._state = SessionState.CLOSED
+                self._clear_pending()
                 out.events.append(SessionEvent.TIMED_OUT)
                 return out
+
+        # Control-packet retransmission / give-up.
+        if (
+            self._pending_ctrl is not None
+            and now - self._pending_ctrl_since >= self.control_rto
+        ):
+            if self._ctrl_retries > self.max_control_retries:
+                # Give up: the retry budget is exhausted. An unanswered SYN /
+                # SYN_ACK means the connection never came up (CONNECT_FAILED);
+                # an unanswered FIN means the close never completed (TIMED_OUT).
+                establishing = self._state in (
+                    SessionState.SYN_SENT,
+                    SessionState.SYN_RCVD,
+                )
+                self._state = SessionState.CLOSED
+                self._clear_pending()
+                out.events.append(
+                    SessionEvent.CONNECT_FAILED
+                    if establishing
+                    else SessionEvent.TIMED_OUT
+                )
+                return out
+
+            # Retransmit the outstanding control packet.
+            self._ctrl_retries += 1
+            self._pending_ctrl_since = now
+            self.last_send = now
+            out.packets.append(self._pending_ctrl)
+            return out
 
         if self._state is SessionState.ESTABLISHED:
             if (

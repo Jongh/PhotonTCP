@@ -28,6 +28,8 @@ __all__ = [
     "SessionEvent",
     "DEFAULT_HEARTBEAT_INTERVAL",
     "DEFAULT_IDLE_TIMEOUT",
+    "DEFAULT_CONTROL_RTO",
+    "DEFAULT_MAX_CONTROL_RETRIES",
 ]
 
 
@@ -70,6 +72,11 @@ class SessionEvent(Enum):
     CLOSED = "CLOSED"
     #: The session died because no traffic arrived within the idle timeout.
     TIMED_OUT = "TIMED_OUT"
+    #: The connection could not be established (or torn down) because a control
+    #: packet (SYN/SYN_ACK/FIN) went unacknowledged past ``max_control_retries``
+    #: retransmissions. Emitted from the establishment phase (SYN_SENT/SYN_RCVD);
+    #: an analogous failure during the close phase surfaces as ``TIMED_OUT``.
+    CONNECT_FAILED = "CONNECT_FAILED"
 
 
 #: Seconds between HEARTBEAT frames sent while a session is ESTABLISHED and idle.
@@ -79,3 +86,13 @@ DEFAULT_HEARTBEAT_INTERVAL: float = 1.0
 #: Must be strictly greater than :data:`DEFAULT_HEARTBEAT_INTERVAL` so that a
 #: peer sending heartbeats on schedule keeps the link alive.
 DEFAULT_IDLE_TIMEOUT: float = 3.0
+
+#: Fixed retransmission timeout (seconds) for unacknowledged control packets
+#: (SYN/SYN_ACK/FIN). M3 uses a simple fixed RTO rather than the adaptive
+#: :class:`~photontcp.reliability.rto.RtoEstimator` for the handshake/close path.
+DEFAULT_CONTROL_RTO: float = 0.5
+
+#: Maximum number of control-packet retransmissions before giving up. Exceeding
+#: this aborts the session (CONNECT_FAILED during establishment, TIMED_OUT
+#: during close).
+DEFAULT_MAX_CONTROL_RETRIES: int = 5
