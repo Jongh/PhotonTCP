@@ -5,6 +5,22 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-19
+
+파일 전송(로드맵 5단계). 신뢰성 있는 단방향 파일 전송 + 앱 레벨 완료 핸드셰이크.
+
+### Added
+
+- **파일 전송 앱** (`photontcp/app/file.py`): `FileSender`/`FileReceiver` — OFFER(name·size·sha256) → ACCEPT → CHUNK* → DONE → ACK/NACK. 전체 파일 **SHA-256 무결성 검증**, 진행률, 손실 채널에서 ARQ 재전송으로 무손실 전달.
+- **앱 레벨 완료 핸드셰이크 = flush-on-close 보장**: 송신측은 수신측 FILE_ACK(신뢰성 스트림)를 받은 뒤에만 종료 → 전 청크 전달·검증 보장(M4 리뷰 후속 해소).
+- **파일 프레임 코덱** (`photontcp/app/file_codec.py`): 타입 구분 길이접두 프레임(제어 JSON + 청크 바이너리 인터리브), `FileFrameReassembler`, `sha256_hex`.
+- 파일 전송 예제(`examples/file_loopback.py`), 파일 테스트 30건(코덱·통합·무결성 실패·진행률·QR 채널 위 전송).
+- 회고 문서(`docs/reports/retro.md`) — M1~M5 누적 회고.
+
+### Notes
+
+- Session 계층 무수정(채팅처럼 순수 추가). 파일 기본 stream_id는 채팅 기본(1)과 공유(병행 시 인자로 분리). 양방향·다중 파일·재개(resume)는 후속. M3/M4 잔여 리뷰 권장은 "신뢰성 정리 마일스톤"으로 이월.
+
 ## [0.5.0] - 2026-06-19
 
 QR 코덱 실물 통합(로드맵 4단계). 패킷이 실제 QR 이미지로 인코딩/디코딩되어 채널을 통과.
