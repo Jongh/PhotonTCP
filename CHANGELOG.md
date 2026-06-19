@@ -5,6 +5,25 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-19
+
+QR 코덱 실물 통합(로드맵 4단계). 패킷이 실제 QR 이미지로 인코딩/디코딩되어 채널을 통과.
+
+### Added
+
+- **QR 코덱** (`photontcp/qr/`): `encode_frame`(segno로 bytes→QR 그레이스케일 numpy 이미지), `decode_frame`(OpenCV `QRCodeDetector`로 이미지→bytes). 패킷 바이트를 base64로 ASCII-safe 래핑해 바이너리 무결성 보장.
+- **ImageLoopbackChannel** (`photontcp/channel/image_loopback.py`): QR 이미지를 메모리로 주고받는 전이중 채널 — 모든 프레임이 실제 QR 인코드/디코드를 거침. 프레임 단위 loss/dup + 선택적 이미지 degrade(노이즈/블러로 EC 견딤 테스트).
+- 기존 세션·ARQ·스트림·채팅 스택이 **수정 없이** QR 이미지 위에서 동작(`Channel` 인터페이스만 구현). QR 루프백 예제(`examples/qr_loopback.py`).
+- QR 테스트 23건(코덱 라운드트립·바이너리 무결성·풀스택 통합; `pytest.importorskip`로 라이브러리 부재 시 skip).
+
+### Dependencies
+
+- 광학 코덱용 선택 의존성 도입: `segno`(QR 생성), `opencv-python`(QR 디코드), `numpy`. 핵심 전송 스택은 여전히 표준 라이브러리만 사용하며, QR은 채널 계층에서만 필요(`pip install photontcp[qr]` / `[optical]`).
+
+### Notes
+
+- 단일 QR 프레임 용량 한계가 있어 `max_payload`는 QR 용량 내로 유지해야 함. 실제 화면/카메라(실물 광학)는 후속 마일스톤. M3/M4 리뷰 권장(NACK 억제·flush-on-close 등) 계속 이월.
+
 ## [0.4.0] - 2026-06-19
 
 스트림 다중화 + 채팅 앱(로드맵 3단계) — **기본 통신 완성**.
