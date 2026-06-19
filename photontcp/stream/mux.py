@@ -37,7 +37,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ..packet.header import Packet
-from ..reliability.arq import ArqEndpoint
+from ..reliability.arq import ArqEndpoint, ArqEvent
 from ..reliability.rto import RtoEstimator
 
 __all__ = [
@@ -63,10 +63,15 @@ class MuxOutput:
         delivered: Per-stream payload chunks delivered to the application,
             keyed by ``stream_id`` and in order. A stream key is present only
             when that stream delivered at least one chunk.
+        failed_streams: Stream ids whose endpoint surfaced an
+            :data:`~photontcp.reliability.arq.ArqEvent.SEND_FAILED` during this
+            operation (a DATA packet exceeded its retransmission budget). Empty
+            on the common (no-failure) path.
     """
 
     packets: list[Packet] = field(default_factory=list)
     delivered: dict[int, list[bytes]] = field(default_factory=dict)
+    failed_streams: list[int] = field(default_factory=list)
 
 
 class StreamMux:
@@ -129,6 +134,27 @@ class StreamMux:
     def has_stream(self, stream_id: int) -> bool:
         """Return whether an endpoint exists for *stream_id*."""
         return stream_id in self._endpoints
+
+    def acked_bytes(self, stream_id: int) -> int:
+        """Return cumulative acknowledged payload bytes for *stream_id*.
+
+        Delegates to the stream's endpoint
+        (:attr:`~photontcp.reliability.arq.ArqEndpoint.acked_bytes`); returns
+        ``0`` when no endpoint exists yet for the stream (nothing was ever sent
+        or received on it).
+        """
+        ep = self._endpoints.get(stream_id)
+        return ep.acked_bytes if ep is not None else 0
+
+    def failed_stream_ids(self) -> list[int]:
+        """Return the ids of all streams whose endpoint has failed, sorted.
+
+        A stream is failed once one of its DATA packets exceeded the endpoint's
+        retransmission budget (:attr:`~photontcp.reliability.arq.ArqEndpoint.is_failed`).
+        """
+        return sorted(
+            sid for sid, ep in self._endpoints.items() if ep.is_failed
+        )
 
     # ------------------------------------------------------------------
     # Internals
@@ -197,17 +223,25 @@ class StreamMux:
         out.packets.extend(result.packets)
         if result.delivered:
             out.delivered[pkt.stream_id] = list(result.delivered)
+        if any(ev is ArqEvent.SEND_FAILED for ev in result.events):
+            out.failed_streams.append(pkt.stream_id)
         return out
 
     def on_tick(self, now: float) -> MuxOutput:
         """Advance every stream's retransmission timers at time *now*.
 
         Returns the union of all packets each endpoint asks to (re)transmit.
+        Any stream whose endpoint surfaces an
+        :data:`~photontcp.reliability.arq.ArqEvent.SEND_FAILED` (its DATA
+        exceeded the retransmission budget) is recorded in
+        :attr:`MuxOutput.failed_streams`.
         """
         out = MuxOutput()
-        for ep in self._endpoints.values():
+        for sid, ep in self._endpoints.items():
             result = ep.on_tick(now)
             out.packets.extend(result.packets)
+            if any(ev is ArqEvent.SEND_FAILED for ev in result.events):
+                out.failed_streams.append(sid)
         return out
 
     def set_session_id(self, sid: int) -> None:

@@ -29,7 +29,18 @@ State table (lossless M2 assumption)::
     FIN_WAIT        recv FIN (our FIN unacked)    -> (same)        FIN_ACK       -
     FIN_WAIT        recv FIN (our FIN acked)      -> CLOSED        FIN_ACK       CLOSED
     CLOSE_WAIT      recv FIN_ACK                  -> CLOSED        -             CLOSED
-    (active)        tick: idle timeout            -> CLOSED        -             TIMED_OUT
+    ESTABLISHED     tick: idle timeout            -> CLOSED        -             TIMED_OUT
+    FIN_WAIT        tick: idle timeout            -> CLOSED        -             CLOSED
+    CLOSE_WAIT      tick: idle timeout            -> CLOSED        -             CLOSED
+
+A data-plane activity hook, :meth:`note_data_activity`, lets the session driver
+refresh ``last_recv`` from DATA/ACK/NACK traffic so an actively-transferring but
+control-plane-quiet session does not trip the idle timeout. It is accepted in
+the active states (ESTABLISHED / FIN_WAIT / CLOSE_WAIT), performs no transition,
+and emits nothing. The idle timeout itself is termination-aware: tripping it
+while a close is already in progress (FIN_WAIT / CLOSE_WAIT) is reported as
+``CLOSED`` (graceful close completed), only genuinely active states report
+``TIMED_OUT``.
 
 Control-packet retransmission (M3-T04)
 --------------------------------------
@@ -266,6 +277,25 @@ class SessionStateMachine:
         self._arm_pending(pkt, now)
         return Output(packets=[pkt])
 
+    def note_data_activity(self, now: float) -> None:
+        """Refresh the idle timer from data-plane traffic (M7-T03).
+
+        The session driver calls this whenever it observes data-plane activity
+        (e.g. a DATA/ACK/NACK frame handed to the ARQ layer) so that an
+        otherwise-quiet-on-the-control-plane but actively-transferring session
+        does not trip the idle timeout. Updates :attr:`last_recv` while the
+        session is in an active state -- ESTABLISHED or a close already in
+        progress (FIN_WAIT/CLOSE_WAIT), where data may still drain. Performs no
+        state transition and produces no packets (no return value); states where
+        no traffic is expected (CLOSED and the handshake states) are ignored.
+        """
+        if self._state in (
+            SessionState.ESTABLISHED,
+            SessionState.FIN_WAIT,
+            SessionState.CLOSE_WAIT,
+        ):
+            self.last_recv = now
+
     def on_packet(self, pkt: Packet, now: float) -> Output:
         """Process an arriving packet: transition + reply + events.
 
@@ -409,8 +439,11 @@ class SessionStateMachine:
         """Evaluate timers: heartbeats, idle timeout, and control retransmits.
 
         * Idle timeout (active states only): if ``now - last_recv >=
-          idle_timeout`` the session is declared dead -> ``TIMED_OUT`` +
-          transition to CLOSED. Checked first so a dead link never heartbeats.
+          idle_timeout`` the session transitions to CLOSED. Checked first so a
+          dead link never heartbeats. The event is termination-aware: a close
+          already in progress (FIN_WAIT / CLOSE_WAIT) yields ``CLOSED`` (the
+          graceful close is treated as completed once the peer goes silent),
+          while genuinely active states (ESTABLISHED) yield ``TIMED_OUT``.
         * Control-packet retransmission (M3-T04): if a control packet is still
           outstanding and ``now - _pending_ctrl_since >= control_rto``, the
           retry limit is enforced first -- if ``_ctrl_retries`` already exceeds
@@ -430,9 +463,20 @@ class SessionStateMachine:
                 self.last_recv is not None
                 and now - self.last_recv >= self.idle_timeout
             ):
+                # A timeout while a close is already in progress (FIN_WAIT /
+                # CLOSE_WAIT) is treated as the graceful close having completed
+                # -- the peer simply went silent after we started tearing down
+                # -- so we surface CLOSED, not TIMED_OUT. Only genuinely active
+                # states (ESTABLISHED, handshake) report TIMED_OUT.
+                closing = self._state in (
+                    SessionState.FIN_WAIT,
+                    SessionState.CLOSE_WAIT,
+                )
                 self._state = SessionState.CLOSED
                 self._clear_pending()
-                out.events.append(SessionEvent.TIMED_OUT)
+                out.events.append(
+                    SessionEvent.CLOSED if closing else SessionEvent.TIMED_OUT
+                )
                 return out
 
         # Control-packet retransmission / give-up.

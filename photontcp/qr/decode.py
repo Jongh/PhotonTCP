@@ -22,16 +22,28 @@ from __future__ import annotations
 
 import base64
 import binascii
+import threading
 
 import cv2
 import numpy as np
 
 __all__ = ["decode_frame"]
 
-# Module-level detector reused across calls for performance. cv2.QRCodeDetector
-# is stateless across detectAndDecode invocations, so a single shared instance
-# is safe for repeated decoding within a single thread.
-_DETECTOR = cv2.QRCodeDetector()
+# Per-thread detector storage. ``cv2.QRCodeDetector`` is not guaranteed to be
+# safe for concurrent ``detectAndDecode`` calls from multiple threads, so each
+# thread lazily creates and reuses its own private detector instance (in
+# preparation for the M6+ camera thread). Within a single thread the behaviour
+# is identical to the previous shared module-level detector.
+_THREAD_LOCAL = threading.local()
+
+
+def _thread_detector() -> "cv2.QRCodeDetector":
+    """Return this thread's private, lazily-created ``cv2.QRCodeDetector``."""
+    detector = getattr(_THREAD_LOCAL, "detector", None)
+    if detector is None:
+        detector = cv2.QRCodeDetector()
+        _THREAD_LOCAL.detector = detector
+    return detector
 
 
 def decode_frame(
@@ -48,7 +60,8 @@ def decode_frame(
         is also accepted and converted to grayscale internally.
     detector:
         Optional ``cv2.QRCodeDetector`` instance to reuse (performance). When
-        ``None`` a shared module-level detector is used.
+        ``None`` a per-thread detector (thread-local, lazily created) is used,
+        which keeps concurrent decoding from multiple threads safe.
 
     Returns
     -------
@@ -65,7 +78,7 @@ def decode_frame(
     string to recover the payload.
     """
     if detector is None:
-        detector = _DETECTOR
+        detector = _thread_detector()
 
     try:
         # Normalize input to a 2D uint8 grayscale array.

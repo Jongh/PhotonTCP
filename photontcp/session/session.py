@@ -57,8 +57,10 @@ from photontcp.stream.mux import (
 from .clock import Clock
 from .state_machine import Output, SessionStateMachine
 from .states import (
+    DEFAULT_CONTROL_RTO,
     DEFAULT_HEARTBEAT_INTERVAL,
     DEFAULT_IDLE_TIMEOUT,
+    DEFAULT_MAX_CONTROL_RETRIES,
     SessionEvent,
     SessionState,
 )
@@ -94,24 +96,15 @@ def _rto_factory_from(rto: RtoEstimator | None) -> Callable[[], RtoEstimator]:
     """Build a zero-arg factory producing fresh estimators for each stream.
 
     The multiplexer needs an *independent* :class:`RtoEstimator` per stream
-    (sharing one instance across streams would mix unrelated RTT samples). For
-    backward compatibility the caller still passes a single ``rto`` instance;
-    we read its configuration and reproduce equivalent fresh estimators. When
-    ``rto`` is ``None`` a default-configured estimator is produced per stream.
+    (sharing one instance across streams would mix unrelated RTT samples). When
+    a template ``rto`` is supplied its :meth:`RtoEstimator.clone` is used as the
+    factory (each call returns a fresh estimator with the same configuration but
+    reset state -- no reaching into private attributes). When ``rto`` is
+    ``None`` a default-configured estimator is produced per stream.
     """
     if rto is None:
         return lambda: RtoEstimator()
-
-    # Reproduce the supplied estimator's configuration for every new stream.
-    # The bounds and initial RTO are the only construction-time settings;
-    # they are read defensively so an unexpected estimator shape still yields
-    # a usable factory.
-    initial_rto = getattr(rto, "_rto", 1.0)
-    min_rto = getattr(rto, "_min_rto", 0.2)
-    max_rto = getattr(rto, "_max_rto", 60.0)
-    return lambda: RtoEstimator(
-        initial_rto=initial_rto, min_rto=min_rto, max_rto=max_rto
-    )
+    return rto.clone
 
 
 class Session:
@@ -137,9 +130,13 @@ class Session:
         arq_max_payload: Chunk size used to split application data into DATA
             packets.
         rto: Adaptive RTO estimator template for the data path. Each stream
-            gets its own estimator reproduced from this template (a single
+            gets its own estimator via :meth:`RtoEstimator.clone` (a single
             instance cannot be shared across independent streams). A
             default-configured estimator is used per stream when omitted.
+        control_rto: Fixed retransmission timeout (seconds) for an outstanding
+            control packet (SYN/SYN_ACK/FIN), forwarded to the state machine.
+        max_control_retries: Maximum control-packet retransmissions before the
+            session is aborted, forwarded to the state machine.
     """
 
     def __init__(
@@ -155,6 +152,8 @@ class Session:
         arq_window_size: int = DEFAULT_ARQ_WINDOW_SIZE,
         arq_max_payload: int = DEFAULT_ARQ_MAX_PAYLOAD,
         rto: RtoEstimator | None = None,
+        control_rto: float = DEFAULT_CONTROL_RTO,
+        max_control_retries: int = DEFAULT_MAX_CONTROL_RETRIES,
     ) -> None:
         self.channel = channel
         self.clock = clock
@@ -164,6 +163,8 @@ class Session:
             isn=isn,
             heartbeat_interval=heartbeat_interval,
             idle_timeout=idle_timeout,
+            control_rto=control_rto,
+            max_control_retries=max_control_retries,
         )
 
         # The data path is a per-stream ARQ multiplexer. Each stream uses a
@@ -297,6 +298,31 @@ class Session:
         self._recv_buffers = {}
         return delivered
 
+    def acked_bytes(self, stream_id: int) -> int:
+        """Return cumulative acknowledged payload bytes on *stream_id*.
+
+        Delegates to the data multiplexer (:meth:`StreamMux.acked_bytes`): the
+        running total of payload bytes the peer has ACKed (removed from the send
+        window) on that stream. Useful for send-progress reporting based on
+        actually-delivered bytes rather than merely-queued bytes. Returns ``0``
+        for a stream that has never sent or received anything.
+
+        Args:
+            stream_id: Target application stream (``>= 1``).
+        """
+        return self._mux.acked_bytes(stream_id)
+
+    def data_failed_streams(self) -> list[int]:
+        """Return the ids of data streams whose delivery has failed, sorted.
+
+        A stream fails once one of its DATA packets exceeds the ARQ
+        retransmission budget (``max_retx``); the endpoint then stops
+        retransmitting. This surfaces that condition (delegating to
+        :meth:`StreamMux.failed_stream_ids`) so callers can detect a stalled
+        transfer. :meth:`pump` does not itself block on a failed stream.
+        """
+        return self._mux.failed_stream_ids()
+
     # ------------------------------------------------------------------ #
     # Reliable data path -- legacy default-stream API
     # ------------------------------------------------------------------ #
@@ -420,6 +446,9 @@ class Session:
             return []
 
         # Application stream (stream_id >= 1): DATA / ACK / NACK -> data mux.
+        # Data-plane traffic keeps the session alive: refresh the idle timer so
+        # an actively-transferring but control-quiet session does not time out.
+        self._machine.note_data_activity(now)
         self._emit_mux(self._mux.on_packet(pkt, now))
         return []
 

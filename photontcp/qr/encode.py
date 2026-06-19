@@ -28,7 +28,18 @@ import base64
 import numpy as np
 import segno
 
-__all__ = ["encode_frame"]
+__all__ = ["encode_frame", "QRCapacityError"]
+
+
+class QRCapacityError(Exception):
+    """Raised when ``data`` does not fit in a single QR symbol.
+
+    segno raises :class:`segno.DataOverflowError` when the (base64-encoded)
+    payload exceeds the largest QR symbol capacity for the requested error
+    level. ``encode_frame`` converts that into this clearer, codec-specific
+    error whose message reports both the raw byte length and the base64 length
+    so callers can size/split payloads instead of seeing an opaque overflow.
+    """
 
 
 def encode_frame(
@@ -61,6 +72,8 @@ def encode_frame(
 
     Raises:
         ValueError: If ``scale < 1`` or ``border < 0``.
+        QRCapacityError: If ``data`` (after base64 encoding) is too large to
+            fit in a single QR symbol at the requested error level.
     """
     if scale < 1:
         raise ValueError(f"scale must be >= 1, got {scale}")
@@ -68,7 +81,14 @@ def encode_frame(
         raise ValueError(f"border must be >= 0, got {border}")
 
     b64 = base64.b64encode(data).decode("ascii")
-    qr = segno.make(b64, error=error)
+    try:
+        qr = segno.make(b64, error=error)
+    except segno.DataOverflowError as exc:
+        raise QRCapacityError(
+            "payload too large for a single QR symbol at error level "
+            f"{error!r}: {len(data)} raw bytes -> {len(b64)} base64 chars "
+            f"({exc})"
+        ) from exc
 
     # segno's qr.matrix is a sequence of rows; each row is a sequence of module
     # values where dark == 1 (truthy) and light == 0 (falsy). Build a compact

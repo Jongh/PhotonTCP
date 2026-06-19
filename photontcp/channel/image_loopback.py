@@ -25,12 +25,21 @@ Noise is applied at *send* time, in **image (frame) units**:
 All randomness is drawn from a single injected :class:`random.Random` seeded via
 ``pair(seed=...)`` so a given seed (and send sequence) reproduces the same
 loss/dup pattern. The global :mod:`random` module is never touched.
+
+The shared RNG is protected by a :class:`threading.Lock` so concurrent
+``send_frame`` calls cannot corrupt the generator's internal state or race on it.
+Because :meth:`pair` hands both endpoints the *same* RNG instance, they are also
+handed the *same* lock so the single noise stream is guarded as one. The lock is
+contended only across threads: in a single thread it is always free, so the order
+and values of RNG draws are identical to the lock-free version — RNG access is
+thread-safe (but determinism remains a single-thread guarantee, as before).
 """
 
 from __future__ import annotations
 
 import queue
 import random
+import threading
 
 import numpy as np
 
@@ -60,6 +69,7 @@ class ImageLoopbackChannel(Channel):
         outbox: "queue.Queue[np.ndarray]",
         rng: random.Random,
         *,
+        rng_lock: "threading.Lock | None" = None,
         loss: float = 0.0,
         dup: float = 0.0,
         scale: int = 8,
@@ -70,6 +80,11 @@ class ImageLoopbackChannel(Channel):
         self._inbox = inbox
         self._outbox = outbox
         self._rng = rng
+        # Guards every access to the shared ``rng``. Paired endpoints share both
+        # the rng and this lock (see :meth:`pair`); a standalone instance gets its
+        # own lock. Uncontended in a single thread, so draw order/values match the
+        # lock-free behaviour exactly (determinism preserved per single thread).
+        self._rng_lock = rng_lock if rng_lock is not None else threading.Lock()
 
         self.loss = loss
         self.dup = dup
@@ -116,6 +131,8 @@ class ImageLoopbackChannel(Channel):
         q_ab: "queue.Queue[np.ndarray]" = queue.Queue()
         q_ba: "queue.Queue[np.ndarray]" = queue.Queue()
         rng = random.Random(seed)
+        # Both endpoints share one rng, so they must share one lock guarding it.
+        rng_lock = threading.Lock()
 
         opts = dict(
             loss=loss,
@@ -127,8 +144,8 @@ class ImageLoopbackChannel(Channel):
         )
 
         # A sends to q_ab and receives from q_ba; B is the mirror image.
-        a = cls(inbox=q_ba, outbox=q_ab, rng=rng, **opts)
-        b = cls(inbox=q_ab, outbox=q_ba, rng=rng, **opts)
+        a = cls(inbox=q_ba, outbox=q_ab, rng=rng, rng_lock=rng_lock, **opts)
+        b = cls(inbox=q_ab, outbox=q_ba, rng=rng, rng_lock=rng_lock, **opts)
         return a, b
 
     def send_frame(self, frame: bytes) -> None:
@@ -144,7 +161,14 @@ class ImageLoopbackChannel(Channel):
             return
 
         # Decide loss before doing any (relatively expensive) encoding work.
-        if self._rng.random() < self.loss:
+        # Each rng draw is guarded individually so the lock is not held across
+        # the costly encode/degrade work. Single-threaded callers never contend,
+        # so the draw order/values are identical to the unlocked version
+        # (seed-based determinism preserved). The thread-safe queue ``put`` and
+        # the encoding both run outside the lock.
+        with self._rng_lock:
+            lost = self._rng.random() < self.loss
+        if lost:
             return
 
         image = encode_frame(
@@ -157,7 +181,9 @@ class ImageLoopbackChannel(Channel):
             image = self.degrade(image)
 
         self._outbox.put(image)
-        if self._rng.random() < self.dup:
+        with self._rng_lock:
+            duplicate = self._rng.random() < self.dup
+        if duplicate:
             self._outbox.put(image)
 
     def recv_frame(self, timeout: float | None = None) -> bytes | None:

@@ -54,11 +54,41 @@ class RtoEstimator:
         :param min_rto: Lower clamp bound for the computed RTO.
         :param max_rto: Upper clamp bound for the computed RTO.
         """
+        self._initial_rto = float(initial_rto)
         self._min_rto = float(min_rto)
         self._max_rto = float(max_rto)
         self._srtt: float | None = None
         self._rttvar: float | None = None
-        self._rto: float = float(initial_rto)
+        self._rto: float = self._initial_rto
+
+    @property
+    def initial_rto(self) -> float:
+        """Configured RTO used before any RTT sample is observed (seconds)."""
+        return self._initial_rto
+
+    @property
+    def min_rto(self) -> float:
+        """Configured lower clamp bound for the computed RTO (seconds)."""
+        return self._min_rto
+
+    @property
+    def max_rto(self) -> float:
+        """Configured upper clamp bound for the computed RTO (seconds)."""
+        return self._max_rto
+
+    def clone(self) -> "RtoEstimator":
+        """Return a fresh estimator with the same configuration.
+
+        The new instance shares the ``initial_rto``/``min_rto``/``max_rto``
+        settings but starts with reset state (no observed samples), making it
+        convenient to derive an independent per-stream estimator without
+        reaching into private attributes.
+        """
+        return RtoEstimator(
+            initial_rto=self._initial_rto,
+            min_rto=self._min_rto,
+            max_rto=self._max_rto,
+        )
 
     @property
     def srtt(self) -> float | None:

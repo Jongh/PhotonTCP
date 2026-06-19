@@ -102,10 +102,12 @@ class ChatSession:
     def received(self) -> list[ChatMessage]:
         """All messages received so far, in stream order.
 
-        Returns the live internal list of accumulated messages (extended by
-        each :meth:`pump`). Callers should treat it as read-only.
+        Returns a **shallow copy** of the internal accumulator (a fresh list
+        each access), so mutating the returned list cannot corrupt the
+        endpoint's internal state. The contained :class:`ChatMessage` objects
+        are shared (treat them as immutable).
         """
-        return self._received
+        return list(self._received)
 
     # ------------------------------------------------------------------ #
     # Lifecycle drivers (delegated to the session)

@@ -5,6 +5,29 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-19
+
+신뢰성 정리/하드닝. M1~M6 누적 리뷰 권장을 한데 모아 견고성·캡슐화·입력 방어·스레드 안전성을 강화(동작 보존, 회귀 0).
+
+### Added
+
+- `RtoEstimator.clone()` + 공개 설정 접근자(`initial_rto`/`min_rto`/`max_rto`).
+- `Session(control_rto=, max_control_retries=)` 노출 · `Session.acked_bytes(stream_id)` · `Session.data_failed_streams()`.
+- `ArqEvent.SEND_FAILED`(데이터 재전송 상한 초과 시) · `ArqEndpoint.acked_bytes`/`is_failed`.
+- `QRCapacityError`(단일 QR 용량 초과를 명확한 예외로).
+
+### Changed
+
+- **ARQ 견고성**: NACK를 구멍당 1회만 보내 NACK 스톰 방지 · 데이터 재전송 상한(`max_retx`)으로 무한 재전송 차단.
+- **세션 견고성**: 데이터 평면 트래픽이 세션 idle 타이머를 갱신(`note_data_activity`) · 종료 진행 중(FIN_WAIT/CLOSE_WAIT) 타임아웃은 `CLOSED`로 일관 보고.
+- **입력 방어**: `FileReceiver`가 OFFER 필드(name/size/sha256)를 검증해 손상 OFFER를 거부.
+- **스레드 안전성**: 루프백 채널 RNG를 락으로 보호 · QR `cv2.QRCodeDetector`를 스레드로컬로(단일 스레드 결정성·동작 보존).
+- **앱 정리**: `ChatSession.received`가 복사본 반환 · 파일 전송 전용 stream(`FILE_STREAM_ID=2`, 채팅과 병행) · `FileSender.progress`를 ACK된 바이트 기준으로.
+
+### Notes
+
+- 하드닝 테스트 27건 추가(전체 166). 스레드 안전성은 스모크 수준 검증 — 실제 동시 송수신 정확성은 실물 광학(카메라 스레드) 마일스톤에서 본격 검증 예정.
+
 ## [0.6.0] - 2026-06-19
 
 파일 전송(로드맵 5단계). 신뢰성 있는 단방향 파일 전송 + 앱 레벨 완료 핸드셰이크.

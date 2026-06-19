@@ -6,6 +6,6 @@ base64 payload representation, error-correction level).
 """
 
 from .decode import decode_frame
-from .encode import encode_frame
+from .encode import QRCapacityError, encode_frame
 
-__all__ = ["encode_frame", "decode_frame"]
+__all__ = ["encode_frame", "decode_frame", "QRCapacityError"]

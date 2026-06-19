@@ -57,7 +57,6 @@ from enum import Enum, auto
 
 from photontcp.session.clock import Clock
 from photontcp.session.session import Session
-from photontcp.stream.mux import DEFAULT_STREAM_ID
 
 from .file_codec import (
     FileFrameReassembler,
@@ -76,12 +75,16 @@ __all__ = [
 ]
 
 #: Default application stream id used by both endpoints. Both peers must agree
-#: on the same stream, so this is a fixed constant (and may be overridden per
-#: endpoint via the ``stream_id`` argument -- both sides must match). It shares
-#: the transport's default stream; pass a distinct ``stream_id`` (e.g. from
-#: :meth:`Session.open_stream` agreed out of band) to run a file transfer
-#: alongside chat on the same session.
-FILE_STREAM_ID = DEFAULT_STREAM_ID
+#: on the same stream, so this is a fixed reserved constant (and may be
+#: overridden per endpoint via the ``stream_id`` argument -- both sides must
+#: match).
+#:
+#: It is deliberately **distinct** from the chat default
+#: (:data:`~photontcp.stream.mux.DEFAULT_STREAM_ID` == 1) so that, with default
+#: arguments alone, a chat (stream 1) and a file transfer (stream 2) can run
+#: concurrently over the *same* session without colliding. Pass a different
+#: ``stream_id`` to use yet another stream.
+FILE_STREAM_ID = 2
 
 
 class FileTransferState(Enum):
@@ -163,8 +166,6 @@ class FileSender:
 
         self._state = FileTransferState.IDLE
         self._reassembler = FileFrameReassembler()
-        #: Bytes handed to the transport so far (for progress accounting).
-        self._sent_bytes = 0
 
     # ------------------------------------------------------------------ #
     # Read-only introspection
@@ -187,24 +188,24 @@ class FileSender:
 
     @property
     def progress(self) -> float:
-        """Fraction of the file queued for delivery, in ``[0.0, 1.0]``.
+        """Fraction of the file **acknowledged** by the peer, in ``[0.0, 1.0]``.
 
-        Counts bytes handed to the transport (not yet acknowledged). An empty
-        file reports ``1.0`` once it has reached/ passed the SENDING phase, else
-        ``0.0``.
+        Based on :meth:`Session.acked_bytes` for this stream -- the running
+        total of ARQ payload bytes the peer has actually ACKed -- divided by the
+        file size. Unlike a queue-based estimate, this does *not* jump to ``1.0``
+        the instant chunks are queued; it rises only as ACKs arrive, so it
+        tracks real delivery progress.
+
+        Because the acked total counts whole ARQ payloads, it includes
+        file-frame overhead (OFFER/CHUNK frame headers, the DONE frame, etc.)
+        and can therefore exceed the raw file size; the result is clamped to
+        ``1.0``. An empty file reports ``1.0``.
         """
         total = len(self.data)
         if total == 0:
-            return 1.0 if self._sent_bytes_done() else 0.0
-        return self._sent_bytes / total
-
-    def _sent_bytes_done(self) -> bool:
-        """Whether all chunks have been queued (used for empty-file progress)."""
-        return self._state in (
-            FileTransferState.SENDING,
-            FileTransferState.DONE_SENT,
-            FileTransferState.COMPLETE,
-        )
+            return 1.0
+        acked = self.session.acked_bytes(self.stream_id)
+        return min(acked / total, 1.0)
 
     # ------------------------------------------------------------------ #
     # Driver
@@ -294,7 +295,6 @@ class FileSender:
             self.session.send_on(
                 self.stream_id, encode_frame(FileFrameType.CHUNK, piece)
             )
-            self._sent_bytes += len(piece)
             offset += len(piece)
 
         self.session.send_on(
@@ -449,17 +449,60 @@ class FileReceiver:
         # ACCEPT/REJECT/ACK/NACK are sender-bound; ignore on the receiver side.
 
     def _handle_offer(self, body: bytes) -> None:
-        """Capture OFFER metadata and (optionally) accept the transfer."""
-        meta = decode_control(body)
-        self._name = meta.get("name")
-        self._expected_size = meta.get("size")
-        self._expected_sha = meta.get("sha256")
+        """Validate and capture OFFER metadata, then (optionally) accept.
+
+        A well-formed OFFER body must contain ``name`` (str), ``size``
+        (non-negative int -- note ``bool`` is rejected even though it is an
+        ``int`` subclass), and ``sha256`` (str). A missing field or a wrong type
+        means the OFFER is malformed or corrupt: the receiver rejects it by
+        sending REJECT and transitions to FAILED rather than proceeding with an
+        unverifiable transfer. A valid OFFER is accepted (when ``auto_accept``).
+        """
+        if not self._offer_is_valid(body):
+            self._reject_offer()
+            return
 
         if self.auto_accept:
             self.session.send_on(
                 self.stream_id, encode_control(FileFrameType.ACCEPT, {})
             )
             self._state = FileTransferState.RECEIVING
+
+    def _offer_is_valid(self, body: bytes) -> bool:
+        """Decode + validate an OFFER body, capturing metadata if well-formed.
+
+        Returns ``True`` and populates ``_name``/``_expected_size``/
+        ``_expected_sha`` when the body is a JSON object carrying ``name`` (str),
+        ``size`` (int ``>= 0``, not ``bool``), and ``sha256`` (str). Returns
+        ``False`` on any decode failure, missing field, or wrong type.
+        """
+        try:
+            meta = decode_control(body)
+        except ValueError:
+            return False
+
+        name = meta.get("name")
+        size = meta.get("size")
+        sha = meta.get("sha256")
+
+        if not isinstance(name, str):
+            return False
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            return False
+        if not isinstance(sha, str):
+            return False
+
+        self._name = name
+        self._expected_size = size
+        self._expected_sha = sha
+        return True
+
+    def _reject_offer(self) -> None:
+        """Send REJECT for a malformed/corrupt OFFER and mark the transfer FAILED."""
+        self.session.send_on(
+            self.stream_id, encode_control(FileFrameType.REJECT, {})
+        )
+        self._state = FileTransferState.FAILED
 
     def _handle_done(self) -> None:
         """Verify the reassembled file and send ACK (match) or NACK (mismatch)."""
