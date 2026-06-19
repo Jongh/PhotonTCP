@@ -5,6 +5,25 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-19
+
+스트림 다중화 + 채팅 앱(로드맵 3단계) — **기본 통신 완성**.
+
+### Added
+
+- **스트림 다중화** (`photontcp/stream/`): `StreamMux` — 하나의 세션 위에 stream_id별 독립 ARQ. 한 스트림의 손실/구멍이 다른 스트림을 막지 않음(HOL 블로킹 제거). `stream_id=0`=제어, `≥1`=앱 스트림, implicit open + 개시자/응답자 패리티 할당.
+- **채팅 앱** (`photontcp/app/`): `ChatSession` — 신뢰성 스트림 위 길이접두(4B)+JSON 메시지(`{msg_id, timestamp, text}`). `StreamReassembler`로 청크 경계 무관 재조립, 유니코드 보존. 손실 채널 양방향 채팅 예제(`examples/chat_loopback.py`).
+- `Session` 스트림 API: `open_stream()` / `send_on()` / `recv_on()` / `recv_all()`.
+- 다중화·채팅 테스트 23건(mux 격리·implicit open·패리티 / 코덱 재조립 / 손실 양방향 채팅).
+
+### Changed
+
+- `Session` 데이터 경로를 단일 ARQ → `StreamMux`로 통합. 레거시 `send()`/`recv()`(기본 스트림 1)는 그대로 보존(M2·M3 회귀 없음). 데이터 ACK가 stream_id≥1을 달아 핸드셰이크 ACK와 라우팅만으로 구분(ACK 분기 단순화).
+
+### Notes
+
+- flush-on-close·반이중(half-close)·per-stream 수명주기, M3 리뷰 권장(NACK 억제 등)은 후속(M5 파일 전송/정리 마일스톤)으로 이월.
+
 ## [0.3.0] - 2026-06-19
 
 신뢰성 계층(로드맵 2단계). 손실·중복·순서뒤바뀜 채널 위에서 신뢰성 있는 순서 보장 전송.
