@@ -5,6 +5,23 @@
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-06-22
+
+실물 광학 채널(로드맵 6단계). QR 프레임을 화면에 표시하고 카메라로 캡처하는 `OpticalChannel`을 추가 — 상위 계층은 무수정으로 빛 위에서 동작(v1.0 후보의 기술 전제).
+
+### Added
+
+- **`OpticalChannel`** (`photontcp/optical/channel.py`): 디스플레이+카메라를 `Channel`로 감싸는 전이중 광학 채널. 백그라운드 캡처 스레드가 프레임을 디코드하고, **1바이트 롤링 nonce 채널 프레이밍**으로 재캡처를 dedup(연속 동일 ARQ 패킷은 nonce가 달라 각각 인도). `OpticalChannel.pair()`로 하드웨어 없는 인메모리 전이중 페어 생성.
+- **디바이스 추상** (`photontcp/optical/devices.py`): `DisplaySink`/`CameraSource` 인터페이스 + 인메모리 페이크 `MemoryDisplay`/`MemoryCamera`/`memory_device_pair()`(유휴 시 같은 프레임 재반환으로 카메라 재캡처 모사) — 채널 로직을 하드웨어 없이 결정적으로 검증.
+- **cv2 실물 어댑터** (`photontcp/optical/cv2_devices.py`): `Cv2Display`(`cv2.imshow`)/`Cv2Camera`(`cv2.VideoCapture`). import는 하드웨어·창 비접촉, cv2 부재 시 패키지 re-export는 가드.
+- 광학 데모 예제(`examples/optical_link.py`, 기본 인메모리 / `--real` 실 디스플레이), 광학 테스트 6건(왕복·재캡처 dedup·연속 동일 패킷·종료·세션 통합·동시성 정확성).
+
+### Notes
+
+- **M7 권장 3 해소**: 양방향 동시 송수신에서 "보낸 집합 == 받은 집합"을 단언해 캡처 스레드의 동시 `decode_frame`(스레드로컬 detector) 정확성을 스모크 초과로 검증. 전체 172 테스트 통과(회귀 0).
+- 상위(세션·신뢰성·앱) 계층 무수정 — `Channel` 인터페이스만으로 채널 교체. `ImageLoopbackChannel`은 시뮬레이션 레퍼런스로 보존.
+- **잔여(v1.0)**: 실 카메라 캡처 왕복은 미검증(`--real`은 디스플레이 절반만 실물). 실 카메라 왕복·VideoCapture 버퍼 staleness·정렬/조명 튜닝은 v1.0 승격 전 수동 검증 대상.
+
 ## [0.7.0] - 2026-06-19
 
 신뢰성 정리/하드닝. M1~M6 누적 리뷰 권장을 한데 모아 견고성·캡슐화·입력 방어·스레드 안전성을 강화(동작 보존, 회귀 0).
