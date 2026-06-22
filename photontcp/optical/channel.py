@@ -21,14 +21,38 @@ Re-capture de-duplication (channel framing nonce)
 A camera runs faster than the display advances, so it captures the *same* QR many
 times; meanwhile the ARQ layer legitimately retransmits identical packets. To tell
 those apart **without depending on timing**, every outgoing frame is prefixed with
-a 1-byte rolling counter (a *nonce*, ``mod 256``) before encoding::
+a fixed-width rolling counter (a *nonce*) before encoding::
 
-    channel_frame = bytes([nonce]) + packet
+    channel_frame = nonce.to_bytes(_NONCE_BYTES, "big") + packet
 
-The capture thread compares each freshly decoded ``channel_frame`` byte-for-byte
-against the **last delivered** one: identical means the same displayed QR was
-re-captured (drop it); different means the nonce advanced to a genuinely new frame
-(strip the nonce, deliver the packet). Two consecutive *identical* ARQ packets
+The nonce is :attr:`OpticalChannel._NONCE_BYTES` byte(s) wide (currently 1 → a
+``mod 256`` period). M8-review 권장 3 worried that a 1-byte nonce could wrap back to a
+value still being compared and be falsely dropped — but that risk only existed under
+M8's *single* last-delivered slot. The windowed de-dup below (depth
+:attr:`OpticalChannel._DEDUP_DEPTH`, far smaller than the 256-frame wrap period)
+**removes the wrap risk by construction**: a wrapped nonce can only collide with a
+frame still inside a window that is orders of magnitude shorter than the wrap period,
+which never happens. So 1 byte stays correct here while keeping the channel framing
+overhead minimal and — critically — not perturbing frame *content* (widening the
+nonce shifts every QR's bytes and pushes some frames into cv2's content-dependent
+detector blind spots; the windowed de-dup lets us avoid that entirely). If a future
+need ever calls for a longer guaranteed-unique period, ``_NONCE_BYTES`` can be raised
+with no other code change.
+
+The capture thread keeps a small bounded window of the most recently delivered
+``channel_frame`` byte strings (a deque of depth :attr:`OpticalChannel._DEDUP_DEPTH`
+mirrored by a set for O(1) membership). For each freshly decoded ``channel_frame``:
+if it is already in the window the *same* displayed QR was re-captured (drop it);
+otherwise the nonce advanced to a genuinely new frame, so strip the nonce, deliver
+the packet, and record the ``channel_frame`` in the window. This is safe because the
+nonce is monotonic within each 256-frame cycle and the de-dup window
+(:attr:`_DEDUP_DEPTH`) is far shorter than that cycle: every *legitimately new* frame
+therefore carries a fresh, never-recently-seen ``channel_frame``, so any
+``channel_frame`` matching one in the window is necessarily a re-capture (camera
+jitter / a still display) and must be dropped. A larger window thus never wrongly
+drops a real frame within it — it only makes re-capture suppression robust to
+*out-of-order* captures (e.g. the camera briefly re-seeing an earlier frame), which a
+single last-delivered slot would mishandle. Two consecutive *identical* ARQ packets
 carry different nonces, so each is delivered exactly once — retransmissions are not
 swallowed. This scheme is deterministic, so it can be exercised with the in-memory
 fakes (a blank-gap-between-frames alternative would be timing-dependent and was
@@ -56,8 +80,10 @@ mirroring :meth:`ImageLoopbackChannel.pair`'s usage feel. Real links inject
 
 from __future__ import annotations
 
+import collections
 import queue
 import threading
+import time
 
 from ..channel.base import Channel
 from ..qr.decode import decode_frame
@@ -70,7 +96,7 @@ __all__ = ["OpticalChannel"]
 class OpticalChannel(Channel):
     """Full-duplex :class:`~photontcp.channel.base.Channel` over a display+camera.
 
-    Outgoing frames are QR-encoded (with a 1-byte rolling nonce prepended) and
+    Outgoing frames are QR-encoded (with a fixed-width rolling nonce prepended) and
     shown on the injected :class:`~photontcp.optical.devices.DisplaySink`. A
     background thread captures frames from the injected
     :class:`~photontcp.optical.devices.CameraSource`, decodes them, de-duplicates
@@ -79,7 +105,42 @@ class OpticalChannel(Channel):
     The capture thread is started lazily on the first :meth:`recv_frame` call (or
     explicitly via :meth:`start`), so an instance used purely to *send* never spins
     up a thread.
+
+    Display pacing (``hold``)
+    -------------------------
+    On a real link the camera needs the displayed QR to stay put long enough to be
+    captured at least once. If consecutive :meth:`send_frame` calls outrun the
+    camera, a frame can be overwritten before it is ever seen (today only ARQ
+    retransmission recovers it). The optional ``hold`` parameter enforces a minimum
+    wall-clock interval between successive displays — set it to at least one camera
+    frame period for real links. ``hold=0`` (the default) disables pacing entirely
+    so the in-memory path and existing tests are byte-for-byte unchanged.
     """
+
+    # Lower bound for ``poll_interval`` (seconds). A non-positive poll interval
+    # would turn the capture loop's camera read into a zero/negative timeout and
+    # busy-spin a core; we clamp to this small positive floor instead of raising so
+    # callers stay robust (M9 minor 4 / completion criterion 3).
+    _MIN_POLL_INTERVAL = 1e-3
+
+    # Fixed width (bytes, big-endian) of the per-frame rolling nonce prefixed to
+    # every channel_frame. 1 byte (mod-256 period) is sufficient because the
+    # windowed de-dup below (_DEDUP_DEPTH) is far shorter than the 256-frame wrap
+    # period, so a wrapped nonce can never collide inside the comparison window —
+    # this removes M8-review 권장 3's wrap risk without widening. Keeping it 1 byte
+    # also avoids shifting QR content into cv2's content-dependent detector blind
+    # spots (widening deterministically broke decoding of one session frame). The
+    # framing is parameterized by this constant, so it can be raised later with no
+    # other code change if a longer guaranteed-unique period is ever needed.
+    _NONCE_BYTES = 1
+
+    # Number of recently delivered channel_frames retained for re-capture de-dup.
+    # A small bounded window (not just the single last-delivered frame) makes
+    # suppression robust to out-of-order captures (camera briefly re-seeing an
+    # earlier frame). Kept far smaller than the nonce wrap period so a wrapped
+    # nonce can never collide within the window; every genuinely new frame is thus
+    # unique within the window (see module docstring).
+    _DEDUP_DEPTH = 8
 
     def __init__(
         self,
@@ -90,6 +151,7 @@ class OpticalChannel(Channel):
         border: int = 4,
         error: str = "m",
         poll_interval: float = 0.01,
+        hold: float = 0.0,
         detector=None,
     ) -> None:
         """Wrap a display+camera pair as a frame-oriented channel.
@@ -103,7 +165,19 @@ class OpticalChannel(Channel):
             :func:`encode_frame`.
         :param poll_interval: Seconds the capture thread waits per
             :meth:`CameraSource.read` poll. Also bounds how promptly the thread
-            notices :meth:`close` (it loops at most this often).
+            notices :meth:`close` (it loops at most this often). A value ``<= 0``
+            is **clamped** up to :attr:`_MIN_POLL_INTERVAL` (not rejected) so a
+            caller passing ``0`` cannot make the capture loop busy-spin.
+        :param hold: Minimum seconds between successive :meth:`send_frame`
+            displays (display pacing). ``send_frame`` measures elapsed time on a
+            monotonic clock since the previous show and sleeps for any shortfall
+            before showing the next frame, so a fast sender cannot overwrite a QR
+            the camera has not yet captured. The default ``0`` (and any negative,
+            which is clamped to ``0``) disables pacing — no sleep, no behavioural
+            change from the un-paced path. The wait is a real wall-clock
+            :func:`time.sleep` on the caller thread, which is acceptable because
+            the channel is already a real-time/threaded boundary (the capture side
+            runs independently).
         :param detector: Optional pre-built detector forwarded to
             :func:`decode_frame`. Leave ``None`` (the default) to use the
             per-thread detector — required for thread-safe decoding from the
@@ -114,11 +188,20 @@ class OpticalChannel(Channel):
         self.scale = scale
         self.border = border
         self.error = error
-        self.poll_interval = poll_interval
+        # Clamp non-positive poll intervals to a small positive floor so the
+        # capture loop's camera-read timeout can never become 0/negative and spin.
+        self.poll_interval = max(poll_interval, self._MIN_POLL_INTERVAL)
+        # Clamp negative holds to 0 (no pacing); 0 short-circuits the pacing path.
+        self._hold = max(hold, 0.0)
         self._detector = detector
 
-        # Rolling 1-byte send counter (nonce). Only the send side (caller thread)
-        # touches it, so no lock is needed. mod 256 keeps it one byte.
+        # Monotonic timestamp of the last display, or None if nothing shown yet.
+        # Only the send side (caller thread) touches it, so no lock is needed.
+        self._last_show_monotonic: float | None = None
+
+        # Rolling fixed-width send counter (nonce). Only the send side (caller
+        # thread) touches it, so no lock is needed. It wraps mod 256 ** _NONCE_BYTES
+        # to stay within _NONCE_BYTES big-endian bytes.
         self._send_nonce = 0
 
         # The single piece of cross-thread state besides ``_closed``: thread-safe.
@@ -142,6 +225,7 @@ class OpticalChannel(Channel):
         border: int = 4,
         error: str = "m",
         poll_interval: float = 0.01,
+        hold: float = 0.0,
     ) -> tuple["OpticalChannel", "OpticalChannel"]:
         """Create two cross-wired in-memory optical channels (no hardware).
 
@@ -162,6 +246,10 @@ class OpticalChannel(Channel):
             :func:`encode_frame`.
         :param error: QR error-correction level, passed to :func:`encode_frame`.
         :param poll_interval: Capture-thread poll interval for both endpoints.
+        :param hold: Display-pacing minimum interval (seconds) forwarded to both
+            endpoints' :meth:`send_frame`. Defaults to ``0`` (no pacing), so the
+            in-memory pair behaves exactly as before; real harnesses raise it to
+            at least one camera frame period.
         :returns: A tuple ``(a, b)`` of connected full-duplex channels.
         """
         # seed is intentionally unused: memory devices are deterministic without
@@ -178,6 +266,7 @@ class OpticalChannel(Channel):
             border=border,
             error=error,
             poll_interval=poll_interval,
+            hold=hold,
         )
         a = cls(display=display_ab, camera=camera_ba, **opts)
         b = cls(display=display_ba, camera=camera_ab, **opts)
@@ -212,11 +301,19 @@ class OpticalChannel(Channel):
 
         :param frame: One serialized packet to transmit.
 
-        A 1-byte rolling nonce is prepended (``bytes([nonce]) + frame``) so the
-        receiver can distinguish a re-captured still frame from a genuinely new one
-        even when consecutive packets are identical (see the module docstring). The
-        combined ``channel_frame`` is encoded via :func:`encode_frame` and rendered
-        with :meth:`DisplaySink.show`; the nonce counter then advances ``mod 256``.
+        A fixed-width rolling nonce is prepended
+        (``nonce.to_bytes(_NONCE_BYTES, "big") + frame``) so the receiver can
+        distinguish a re-captured still frame from a genuinely new one even when
+        consecutive packets are identical (see the module docstring). The combined
+        ``channel_frame`` is encoded via :func:`encode_frame` and rendered with
+        :meth:`DisplaySink.show`; the nonce counter then advances mod
+        ``256 ** _NONCE_BYTES``.
+
+        When ``hold > 0`` (display pacing), this method sleeps before showing so
+        that at least ``hold`` seconds elapse since the previous display — giving a
+        real camera time to capture the prior QR before it is replaced. With
+        ``hold == 0`` (the default) the pacing branch is skipped entirely: no
+        monotonic read, no sleep, behaviour identical to the un-paced path.
 
         A closed channel silently discards the send. :class:`~photontcp.qr.encode.
         QRCapacityError` is **not** caught — it propagates so the layer above can
@@ -226,7 +323,7 @@ class OpticalChannel(Channel):
             return
 
         nonce = self._send_nonce
-        channel_frame = bytes([nonce]) + frame
+        channel_frame = nonce.to_bytes(self._NONCE_BYTES, "big") + frame
         # encode_frame may raise QRCapacityError; let it propagate untouched.
         image = encode_frame(
             channel_frame,
@@ -234,10 +331,24 @@ class OpticalChannel(Channel):
             border=self.border,
             error=self.error,
         )
+
+        # Display pacing: ensure >= hold seconds between successive shows, using a
+        # monotonic clock (immune to wall-clock jumps). hold == 0 short-circuits so
+        # the default path takes no timestamp and never sleeps. The wait is a real
+        # time.sleep on the caller thread — acceptable here because the channel is
+        # already a real-time/threaded boundary (capture runs on its own thread).
+        if self._hold > 0 and self._last_show_monotonic is not None:
+            elapsed = time.monotonic() - self._last_show_monotonic
+            if elapsed < self._hold:
+                time.sleep(self._hold - elapsed)
+
         self._display.show(image)
+        if self._hold > 0:
+            self._last_show_monotonic = time.monotonic()
         # Advance only after a successful show so a capacity failure does not burn
-        # a nonce (keeps the rolling sequence contiguous across retries).
-        self._send_nonce = (nonce + 1) & 0xFF
+        # a nonce (keeps the rolling sequence contiguous across retries). Wrap mod
+        # 256 ** _NONCE_BYTES to stay within the fixed nonce width.
+        self._send_nonce = (nonce + 1) % (256 ** self._NONCE_BYTES)
 
     def recv_frame(self, timeout: float | None = None) -> bytes | None:
         """Return the next recovered packet, or ``None`` on timeout.
@@ -269,11 +380,17 @@ class OpticalChannel(Channel):
         if the array *is* the one last decoded (a memory re-capture of an unchanged
         display — a real camera yields distinct arrays so this never triggers), (2)
         decodes the QR (a decode failure is a lost frame — ignored, ARQ retransmits),
-        (3) drops the frame if its ``channel_frame`` bytes equal the last delivered
-        ones (same QR re-captured), else strips the nonce and queues the packet.
+        (3) drops the frame if its ``channel_frame`` is already in the recent-N
+        de-dup window (same QR re-captured, possibly out of order), else strips the
+        fixed-width nonce, queues the packet, and records the ``channel_frame`` in
+        the window.
         """
         last_decoded_array = None  # identity-only; for the cheap re-decode skip
-        last_delivered = None  # bytes of the last channel_frame put on the inbox
+        # Bounded window of recently delivered channel_frames. The deque caps the
+        # history at _DEDUP_DEPTH; recent_set mirrors its contents for O(1)
+        # membership. Both are touched only by this thread, so no lock is needed.
+        recent = collections.deque(maxlen=self._DEDUP_DEPTH)
+        recent_set = set()
 
         while not self._closed:
             img = self._camera.read(timeout=self.poll_interval)
@@ -290,18 +407,27 @@ class OpticalChannel(Channel):
             if channel_frame is None:
                 # Undecodable -> treated as a lost frame; ARQ will retransmit.
                 continue
-            if len(channel_frame) == 0:
-                # Defensive: a zero-length frame carries no nonce/payload.
+            if len(channel_frame) < self._NONCE_BYTES:
+                # Defensive: too short to carry a full fixed-width nonce.
                 continue
 
-            # Byte-exact de-dup: same channel_frame == same displayed QR recaptured.
-            if channel_frame == last_delivered:
+            # Recent-N de-dup: a channel_frame already in the window is a re-capture
+            # (camera jitter / still display, possibly out of order). The monotonic
+            # nonce guarantees every genuinely new frame is unique within the
+            # window, so this can never drop a real frame (see module docstring).
+            if channel_frame in recent_set:
                 continue
-            last_delivered = channel_frame
 
-            # Strip the leading nonce byte; deliver the packet payload only.
-            payload = channel_frame[1:]
+            # Strip the fixed-width nonce; deliver the packet payload only.
+            payload = channel_frame[self._NONCE_BYTES:]
             self._inbox.put(payload)
+
+            # Record as delivered. Drop the about-to-be-evicted item from the set
+            # mirror before the deque overwrites it, keeping the two views in sync.
+            if len(recent) == recent.maxlen:
+                recent_set.discard(recent[0])
+            recent.append(channel_frame)
+            recent_set.add(channel_frame)
 
     def close(self) -> None:
         """Mark the channel closed, stop capturing, and release the devices.

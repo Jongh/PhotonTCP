@@ -5,6 +5,27 @@
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-06-22
+
+실물 광학 링크 하드닝(로드맵 6단계 하드닝). `OpticalChannel`의 실 카메라 경로를 동작·검증 가능한 상태로 보강하고, 실 하드웨어 검증 하니스를 추가. v1.0("빛만으로 실 통신") 승격은 수동 하드웨어 사인오프 통과를 전제로 분리.
+
+### Added
+
+- **디스플레이 프레임 페이싱**: `OpticalChannel(hold=…)` — 연속 표시 사이 최소 간격(단조 시계)을 보장해 실 카메라가 각 QR을 잡을 시간을 확보. `hold=0`(기본)은 동작 변화 없음.
+- **`Cv2Camera` 신선 프레임**: `CAP_PROP_BUFFERSIZE=1`(best-effort) + 고정 한도 드레인(`drain_to_latest`)으로 드라이버 버퍼 staleness 완화. 선택적 해상도 힌트(`width`/`height`).
+- **실물 검증 하니스**: `examples/optical_selfcheck.py`(한 기기 반이중 — 화면→자기 카메라 수신율 PASS/FAIL), `examples/optical_link.py --real --role {sender,receiver}`(2-머신 실 왕복).
+
+### Changed
+
+- **재캡처 dedup 윈도우화**: 단일 last-delivered 슬롯 → 최근 N(8) 프레임 deque+set. 순서 흔들림(이전 프레임 재캡처)에도 거짓 인도/누락 없이 1회 인도.
+- **파라미터 가드**: `poll_interval<=0`은 양수 하한으로 클램프(캡처 루프 busy-spin 차단), `hold<0`은 0으로.
+
+### Notes
+
+- 신규 3 테스트 추가(전체 175, 회귀 0). 상위(세션·신뢰성·앱·코덱) 계층 무수정 — `Channel` 인터페이스만으로 채널 보강.
+- nonce는 1바이트 유지(다중 바이트는 한 프레임을 cv2 QR detector의 콘텐츠 의존 블라인드스폿에 빠뜨려 디코드 회귀). 윈도우 dedup + ARQ 특성(재전송 상한·고유 seq)이 결합해 래핑 거짓 dedup을 실질 제거.
+- **v1.0 잔여(수동)**: 실 카메라 셀프체크 수신율 ≥80% + 2-머신 왕복(ESTABLISHED→MATCH→CLOSED) 사인오프, cv2 디코드 견고화(수신율↑), 조명/정렬/`hold`·`scale` 튜닝. 통과 시 v1.0.0 승격.
+
 ## [0.8.0] - 2026-06-22
 
 실물 광학 채널(로드맵 6단계). QR 프레임을 화면에 표시하고 카메라로 캡처하는 `OpticalChannel`을 추가 — 상위 계층은 무수정으로 빛 위에서 동작(v1.0 후보의 기술 전제).

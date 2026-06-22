@@ -50,21 +50,37 @@ QR 프레임을 **실제 화면(`Cv2Display`)에 띄우고 실제 카메라(`Cv2
 하드웨어는 `DisplaySink`/`CameraSource` 추상 뒤로 격리되어, 메모리 페이크(`OpticalChannel.pair()`)로
 하드웨어 없이 결정적으로 테스트·시연할 수 있습니다.
 
+M9에서 실물 경로가 하드닝되었습니다: `Cv2Camera`가 드라이버 버퍼를 최소화하고 **최신 프레임을
+드레인**해 지연 누적을 막고, `OpticalChannel(hold=…)`이 **디스플레이 프레임 페이싱**(카메라가 각 QR을
+최소 1회 잡을 시간 보장)을 제공하며, 재캡처 dedup이 **최근 N프레임 윈도우**로 순서 흔들림에도 견고해졌고,
+`poll_interval` 등 파라미터에 하한 가드가 추가되었습니다.
+
 데모 예제 [`examples/optical_link.py`](examples/optical_link.py):
 
 ```
-python examples/optical_link.py            # 인메모리 모드 (화면/카메라 불필요, 항상 실행 가능)
-python examples/optical_link.py --real      # 송신 QR 프레임을 실제 화면 창에 렌더 (웹캠/화면 필요, 수동)
+python examples/optical_link.py                       # 인메모리 모드 (화면/카메라 불필요, 항상 실행 가능)
+python examples/optical_link.py --real                 # 송신 QR 프레임을 실제 화면 창에 렌더 (디스플레이만, 수동)
+python examples/optical_link.py --real --role sender    # 실물 양방향: 한 기기에서 송신 역할
+python examples/optical_link.py --real --role receiver  # 실물 양방향: 다른 기기에서 수신 역할
 ```
 
 기본(인메모리) 모드는 화면·카메라 없이 항상 동작하며 핸드셰이크→채팅→종료 왕복을 실증합니다.
-`--real`은 실제 OpenCV 창에 송신 QR 프레임을 띄워 **디스플레이 절반**을 실물 하드웨어로 증명합니다.
 
-**v1.0 후보 / 후속**: 인메모리 광학 경로는 완성되었고 실물 디스플레이 출력이 가능합니다. 다만
-**진정한 양방향 광학 루프는 화면 2개 + 카메라 2개**(피어당 1쌍)가 필요합니다 — 한 기기의 화면+카메라는
-자기 창을 보기 어렵기 때문입니다. 두 번째 기기의 카메라를 창에 겨누거나 `Cv2Camera` 기반 피어를 두 대
-구동하면 물리적으로 루프가 닫힙니다. 이 양방향 실물 루프(및 조명/정렬 민감성 튜닝)가 v1.0 승격의 잔여
-과제입니다.
+#### 실물 검증 절차 (수동, 하드웨어 필요)
+
+CI에서 자동 검증 불가한 실 카메라 경로는 아래 하니스로 수동 검증합니다:
+
+1. **셀프체크 (반이중, 한 기기)** — [`examples/optical_selfcheck.py`](examples/optical_selfcheck.py):
+   화면에 일련의 QR을 띄우고 그 화면을 비춘 웹캠으로 캡처·디코드해 **수신율/정확도 PASS/FAIL**을
+   출력합니다. `python examples/optical_selfcheck.py --camera 0 --hold 0.3 --count 20` (PASS 기준:
+   수신율 ≥ 80%).
+2. **2-머신 왕복 (전이중)** — `optical_link.py --real --role …`를 두 기기에서 마주보게 실행해(화면 2 +
+   카메라 2) 핸드셰이크→메시지 교환→graceful close가 성립하는지 확인합니다.
+
+**v1.0 사인오프 게이트**: (a) 셀프체크 수신율 ≥ 80%, **그리고** (b) 2-머신 왕복으로 양 피어가
+ESTABLISHED→메시지 MATCH→both CLOSED. 두 조건이 실물에서 통과하면 "빛만으로 실 통신"이 증명되어
+v1.0으로 승격합니다. 한 기기는 자기 창을 자기 카메라로 보기 어려우므로 양방향 루프엔 화면 2 + 카메라
+2(또는 외부 카메라)가 필요합니다. 조명·정렬·`--hold`/`--scale` 튜닝이 수신율에 영향을 줍니다.
 
 ## 개발 방식
 

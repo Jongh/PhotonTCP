@@ -29,26 +29,48 @@ Two modes
     only place virtual time is supplemented by wall time) and bounds every loop
     with both a round cap and a wall-clock deadline so it can never hang.
 
-**Real (``--real``)** — ``python examples/optical_link.py --real``
+**Real, display-only (``--real`` without ``--role``)**
+    ``python examples/optical_link.py --real``
     Renders each outgoing QR frame to an actual on-screen OpenCV window
     (:class:`Cv2Display`) so you can SEE the real QR pictures the protocol emits,
     while the session round-trip itself still runs over the in-memory link (so the
     demo stays a self-contained, non-flaky proof). Requires ``opencv-python`` and a
     display; optional ``--window NAME`` sets the window title.
 
-    Honest scope: a single screen + camera on one machine cannot easily see its own
+**Real round-trip (``--real --role sender`` / ``--real --role receiver``)**
+    A genuine real-hardware optical link built from BOTH :class:`Cv2Display` and
+    :class:`Cv2Camera`: each invocation drives ONE peer's :class:`OpticalChannel`
+    over real devices (show outgoing QR on this screen, capture the *other* peer's
+    screen with this camera). Run it on **two machines** facing each other (or one
+    machine + an external camera viewing a second screen):
+
+        # machine 1
+        python examples/optical_link.py --real --role sender
+        # machine 2
+        python examples/optical_link.py --real --role receiver
+
+    The two peers must face each other: each peer's ``Cv2Display`` window must be in
+    the field of view of the OTHER peer's ``Cv2Camera``. ``--role sender`` is the
+    connection initiator; ``--role receiver`` is the responder. Both processes drive
+    the SAME handshake -> couple of tiny messages -> graceful close progression as
+    the in-memory demo, but every frame really travels over light. Pace the link
+    with ``--scale`` (QR module pixels) and ``--hold`` (seconds a frame is held on
+    screen, at least one camera frame period). ``--camera N`` selects the capture
+    device index. cv2/camera absence is handled gracefully (clear message, exit 0).
+
+    Honest scope: a single screen + camera on one machine cannot see its own
     window, so a true two-peer optical *loop* needs **two screens and two cameras**
-    (one per peer) — this is the remaining limitation on the road to a fully
-    hardware-proven v1.0. ``--real`` here proves the *display* half on real
-    hardware (real QR frames on a real screen) and is a MANUAL run only; point
-    another device's camera at the window, or pair it with a second machine running
-    a ``Cv2Camera``-backed ``OpticalChannel``, to close the loop physically.
+    (one per peer) — running both roles on one machine pointed at one screen will
+    not work. This role mode is the path to a fully hardware-proven v1.0 and is a
+    MANUAL run only (never exercised by CI).
 
 Run from the repository root::
 
     python examples/optical_link.py            # in-memory, always works
     python examples/optical_link.py --real      # also show real QR frames on screen
     python examples/optical_link.py --real --window "PhotonTCP demo"
+    python examples/optical_link.py --real --role sender    # real peer (machine 1)
+    python examples/optical_link.py --real --role receiver  # real peer (machine 2)
 
 Output is intentionally English-only so it stays readable on Windows consoles
 regardless of code page.
@@ -373,6 +395,166 @@ def _drive_session(display=None) -> int:
     return 0
 
 
+def _drive_real_peer(args: argparse.Namespace) -> int:
+    """Drive ONE peer over a REAL optical channel (Cv2Display + Cv2Camera).
+
+    Unlike the in-memory modes, this builds a single :class:`OpticalChannel` over
+    genuine hardware: outgoing QR frames are shown on a real screen and incoming
+    frames are recovered from a real camera. The OTHER peer must be running the
+    opposite ``--role`` on a second machine (or via an external camera), with the
+    two screens/cameras facing each other, to close the optical loop physically.
+
+    ``--role sender`` is the initiator; ``--role receiver`` is the responder. The
+    same handshake -> tiny messages -> graceful close progression as the in-memory
+    demo is driven, but every frame really travels over light. Returns a process
+    exit code (0 = success, or a graceful no-hardware exit).
+    """
+    # Import the cv2-backed devices lazily and only for the real role mode so the
+    # default in-memory path never depends on a working GUI/camera.
+    from photontcp.optical import Cv2Camera, Cv2Display
+
+    if Cv2Display is None or Cv2Camera is None:  # pragma: no cover - cv2-absent
+        print("    --real --role needs opencv-python (cv2). Install it and retry.")
+        return 0
+
+    role = args.role  # "sender" | "receiver"
+    is_initiator = role == "sender"
+    print("=" * 68)
+    print(f"PhotonTCP optical-link demo (REAL hardware peer, role={role})")
+    print(
+        f"mode: REAL Cv2Display + Cv2Camera  scale={args.scale}px  "
+        f"hold={args.hold}s  window={args.window!r}  camera={args.camera}"
+    )
+    print(
+        "    NOTE: the OTHER peer must be running the opposite role facing this\n"
+        f"    screen/camera: run '--real --role "
+        f"{'receiver' if is_initiator else 'sender'}' on the second machine, with\n"
+        "    its Cv2Display window in THIS camera's view and vice versa."
+    )
+    print("=" * 68)
+
+    # Build the real display first; if the camera is absent, exit gracefully.
+    display = Cv2Display(window=args.window)
+    try:
+        camera = Cv2Camera(index=args.camera)
+    except RuntimeError as exc:
+        print(f"    no camera available ({exc}). Connect a camera and retry.")
+        display.close()
+        return 0
+
+    chan = OpticalChannel(display, camera, scale=args.scale, hold=args.hold)
+
+    started = time.perf_counter()
+    deadline = started + WALL_DEADLINE_S
+
+    print("\n[0] QR encoding proof (data -> real QR image over light)")
+    _show_qr_proof()
+
+    clock = ManualClock()
+    session = Session(
+        chan,
+        clock,
+        is_initiator=is_initiator,
+        session_id=1 if is_initiator else 0,
+        isn=1000 if is_initiator else 5000,
+        heartbeat_interval=HEARTBEAT_INTERVAL,
+        idle_timeout=IDLE_TIMEOUT,
+    )
+    chat = ChatSession(session, clock)
+
+    established = False
+    messages_matched = False
+    closed = False
+    try:
+        # --- [1] Handshake over the real optical link. ------------------- #
+        print("\n[1] Handshake over the REAL optical link (display + camera)")
+        if is_initiator:
+            print("    A.connect() -> SYN shown as a QR frame, captured by the peer")
+            chat.connect()
+        else:
+            print("    waiting to capture the peer's SYN over light...")
+        for rnd in range(1, MAX_HANDSHAKE_ROUNDS + 1):
+            if time.perf_counter() > deadline:
+                break
+            clock.advance(ROUND_DT)
+            time.sleep(args.hold)
+            chat.pump()
+            if chat.is_established:
+                print(f"    => this peer ESTABLISHED after {rnd} pump round(s)")
+                established = True
+                break
+        if not established:
+            print("    ERROR: handshake did not complete within the cap/deadline")
+            return 1
+
+        # --- [2] Exchange a couple of tiny messages over light. ---------- #
+        print("\n[2] Exchange tiny messages over light")
+        out_msgs = MESSAGES_A if is_initiator else MESSAGES_B
+        expect = len(MESSAGES_B if is_initiator else MESSAGES_A)
+        next_out = 0
+        for _rnd in range(1, MAX_CHAT_ROUNDS + 1):
+            if time.perf_counter() > deadline:
+                break
+            clock.advance(ROUND_DT)
+            time.sleep(args.hold)
+            if next_out < len(out_msgs):
+                mid = chat.send_message(out_msgs[next_out])
+                print(f"    this peer sends msg#{mid} over light: {out_msgs[next_out]}")
+                next_out += 1
+            got = chat.pump()
+            _print_arrivals("[recv]", got)
+            if next_out >= len(out_msgs) and len(chat.received) >= expect:
+                break
+        recv_texts = _texts(chat.received)
+        expected_texts = MESSAGES_A if is_initiator else MESSAGES_B
+        # Each peer receives the OTHER peer's outgoing set.
+        expected_in = MESSAGES_B if is_initiator else MESSAGES_A
+        messages_matched = recv_texts == expected_in
+        print(
+            f"    received {len(recv_texts)}/{len(expected_in)} "
+            f"-> {'MATCH' if messages_matched else 'MISMATCH'}"
+        )
+
+        # --- [3] Graceful close over the real optical link. -------------- #
+        print("\n[3] Graceful close over the REAL optical link")
+        if is_initiator:
+            print("    A.close() -> FIN shown as a QR frame")
+            chat.close()
+        for rnd in range(1, MAX_CLOSE_ROUNDS + 1):
+            if time.perf_counter() > deadline:
+                break
+            clock.advance(ROUND_DT)
+            time.sleep(args.hold)
+            chat.pump()
+            if chat.is_closed:
+                print(f"    => this peer CLOSED after {rnd} pump round(s)")
+                closed = True
+                break
+        if not closed:
+            print("    WARNING: this peer did not reach CLOSED within the cap/deadline")
+    finally:
+        # Always stop the background capture thread and release the real devices.
+        chan.close()
+        display.close()
+        camera.close()
+
+    elapsed = time.perf_counter() - started
+    ok = established and messages_matched and closed
+    print("\n" + "-" * 68)
+    print(
+        f"Summary: REAL OpticalChannel role={role} | "
+        f"established={established} | messages={'MATCH' if messages_matched else 'MISMATCH'} "
+        f"| closed={closed} | wall={elapsed:.2f}s"
+    )
+    print(f"result: {'PASS' if ok else 'FAIL'}")
+    print(
+        "    (a FAIL usually means the OTHER peer was not running the opposite role\n"
+        "    facing this screen/camera -- this is a two-process, two-machine demo.)"
+    )
+    print("-" * 68)
+    return 0 if ok else 1
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     """Parse command-line arguments for the two demo modes."""
     parser = argparse.ArgumentParser(
@@ -385,9 +567,22 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--real",
         action="store_true",
         help=(
-            "Also render outgoing QR frames to a real on-screen OpenCV window "
-            "(needs a display). MANUAL run only -- a true two-peer optical loop "
-            "needs two screens + two cameras (see the module docstring)."
+            "Use real hardware. Without --role: render outgoing QR frames to a "
+            "real OpenCV window while the session runs in-memory (display-only "
+            "proof, needs a display). With --role sender|receiver: drive ONE peer "
+            "over a REAL Cv2Display + Cv2Camera optical link (see --role). MANUAL "
+            "run only -- a true two-peer loop needs two screens + two cameras."
+        ),
+    )
+    parser.add_argument(
+        "--role",
+        choices=["sender", "receiver"],
+        default=None,
+        help=(
+            "Real round-trip role (requires --real): 'sender' is the connection "
+            "initiator, 'receiver' the responder. Run opposite roles on two "
+            "machines facing each other (each Cv2Display in the other's Cv2Camera "
+            "view) to form a real optical link. Only meaningful with --real."
         ),
     )
     parser.add_argument(
@@ -400,17 +595,44 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "Camera device index, accepted for forward compatibility with a "
-            "two-machine real loop. The bundled --real mode displays only and does "
-            "not open a camera, so this is currently unused."
+            "Camera device index for the real round-trip mode (--real --role ...), "
+            "passed to Cv2Camera to capture the other peer's screen (default: 0). "
+            "Unused by the display-only --real mode."
         ),
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--scale",
+        type=int,
+        default=SCALE,
+        help=(
+            f"QR module pixel size for the real round-trip mode (default: {SCALE}). "
+            "Larger modules are easier for a camera to resolve; the in-memory modes "
+            "use the built-in SCALE constant."
+        ),
+    )
+    parser.add_argument(
+        "--hold",
+        type=float,
+        default=0.4,
+        help=(
+            "Seconds each QR frame is held on screen / paced per pump round in the "
+            "real round-trip mode (default: 0.4). Set at least one camera frame "
+            "period so the camera can capture each frame; unused in-memory."
+        ),
+    )
+    args = parser.parse_args(argv)
+    if args.role is not None and not args.real:
+        parser.error("--role requires --real (it only applies to the real link)")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
     """Drive the demo and return a process exit code (0 = success)."""
     args = _parse_args(argv)
+
+    # Real round-trip role mode: drive ONE peer over genuine hardware devices.
+    if args.real and args.role:
+        return _drive_real_peer(args)
 
     print("=" * 68)
     print("PhotonTCP optical-link demo (real OpticalChannel, in-memory devices)")

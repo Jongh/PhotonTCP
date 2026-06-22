@@ -142,6 +142,16 @@ class MemoryCamera(CameraSource):
         self._last: np.ndarray | None = None
         self._closed = False
 
+    #: Lower bound (seconds) for the queue wait when ``repeat_last`` is active and
+    #: the caller passes a falsy timeout. A pathological direct caller looping
+    #: ``while True: read(0)`` would otherwise poll with a 0.0 timeout and peg a
+    #: core; flooring the wait here yields the CPU between idle ticks while still
+    #: returning a freshly enqueued frame promptly. ``OpticalChannel`` always
+    #: passes ``poll_interval`` (>= 1e-3 after its own clamp), so this floor never
+    #: changes the timeout the channel asked for and the existing optical tests are
+    #: unaffected — it only protects misuse by direct, tight-loop callers.
+    _MIN_REPEAT_WAIT = 1e-3
+
     def read(self, timeout: float | None = None) -> np.ndarray | None:
         """Return the next enqueued frame, or repeat/``None`` when idle.
 
@@ -149,6 +159,12 @@ class MemoryCamera(CameraSource):
         remembered "last" frame). If none arrives within ``timeout``, the last
         captured frame is returned again when ``repeat_last`` is set, otherwise
         ``None``. A closed camera always returns ``None``.
+
+        When ``repeat_last`` is set and ``timeout`` is falsy (``0`` or ``None``),
+        the queue wait is floored to :attr:`_MIN_REPEAT_WAIT` so a direct caller
+        polling in a tight loop cannot busy-spin on a 0.0-second wait; a newly
+        enqueued frame is still returned as soon as it arrives. Semantics are
+        otherwise unchanged.
         """
         if self._closed:
             return None
@@ -157,8 +173,14 @@ class MemoryCamera(CameraSource):
                 image = self._source.get(block=True)
             else:
                 # Bounded wait so an idle camera can fall through to a repeat
-                # (or None) instead of blocking forever on the empty queue.
-                image = self._source.get(block=True, timeout=timeout or 0.0)
+                # (or None) instead of blocking forever on the empty queue. When
+                # repeating with a falsy timeout, floor the wait to a small
+                # positive value so a tight direct-poll loop does not spin.
+                if self._repeat_last and not timeout:
+                    wait = self._MIN_REPEAT_WAIT
+                else:
+                    wait = timeout or 0.0
+                image = self._source.get(block=True, timeout=wait)
         except queue.Empty:
             # No new frame this tick: model re-capturing the still-displayed QR.
             return self._last if self._repeat_last else None
