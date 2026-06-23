@@ -1,6 +1,6 @@
 [project]
 name = "photontcp"
-version = "0.9.0"
+version = "0.10.0"
 description = "화면+카메라+애니메이션 QR 코드로 동작하는 TCP 유사 신뢰성 양방향 전송 프로토콜"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -25,19 +25,23 @@ a fixed-width rolling counter (a *nonce*) before encoding::
 
     channel_frame = nonce.to_bytes(_NONCE_BYTES, "big") + packet
 
-The nonce is :attr:`OpticalChannel._NONCE_BYTES` byte(s) wide (currently 1 → a
-``mod 256`` period). M8-review 권장 3 worried that a 1-byte nonce could wrap back to a
-value still being compared and be falsely dropped — but that risk only existed under
-M8's *single* last-delivered slot. The windowed de-dup below (depth
-:attr:`OpticalChannel._DEDUP_DEPTH`, far smaller than the 256-frame wrap period)
-**removes the wrap risk by construction**: a wrapped nonce can only collide with a
-frame still inside a window that is orders of magnitude shorter than the wrap period,
-which never happens. So 1 byte stays correct here while keeping the channel framing
-overhead minimal and — critically — not perturbing frame *content* (widening the
-nonce shifts every QR's bytes and pushes some frames into cv2's content-dependent
-detector blind spots; the windowed de-dup lets us avoid that entirely). If a future
-need ever calls for a longer guaranteed-unique period, ``_NONCE_BYTES`` can be raised
-with no other code change.
+The nonce is :attr:`OpticalChannel._NONCE_BYTES` byte(s) wide (M10: **2** → a
+``mod 65536`` period). M8-review 권장 3 worried that a 1-byte nonce could wrap back to a
+value still being compared and be falsely dropped. The windowed de-dup below (depth
+:attr:`OpticalChannel._DEDUP_DEPTH`) already made that impossible in practice — a
+wrapped nonce can only collide with a frame still inside a window orders of magnitude
+shorter than the wrap period, which never happens — but the de-dup argument only made
+the corner *practically* unreachable, not arithmetically absent. M9 had to keep the
+width at 1 because widening shifts every QR's bytes and one shifted frame fell into
+cv2's content-dependent detector blind spot, breaking decode. **M10 hardened the
+decoder** (preprocessing cascade + alternate-detector fallback, see
+:func:`photontcp.qr.decode.decode_frame`), so widening no longer regresses decoding
+(re-validated: a 1B-vs-2B decode-rate sweep is 100% on both, and the full suite is
+green at 2 bytes). The width is therefore raised to 2, which pushes the wrap period
+(65536) so far beyond both the de-dup window and any realistic in-flight frame count
+that the false-dedup corner is gone *arithmetically* as well as practically. The
+framing is parameterized by this constant, so the width can still be changed in one
+place if ever needed.
 
 The capture thread keeps a small bounded window of the most recently delivered
 ``channel_frame`` byte strings (a deque of depth :attr:`OpticalChannel._DEDUP_DEPTH`
@@ -45,7 +49,7 @@ mirrored by a set for O(1) membership). For each freshly decoded ``channel_frame
 if it is already in the window the *same* displayed QR was re-captured (drop it);
 otherwise the nonce advanced to a genuinely new frame, so strip the nonce, deliver
 the packet, and record the ``channel_frame`` in the window. This is safe because the
-nonce is monotonic within each 256-frame cycle and the de-dup window
+nonce is monotonic within each wrap cycle (65536 frames) and the de-dup window
 (:attr:`_DEDUP_DEPTH`) is far shorter than that cycle: every *legitimately new* frame
 therefore carries a fresh, never-recently-seen ``channel_frame``, so any
 ``channel_frame`` matching one in the window is necessarily a re-capture (camera
@@ -124,15 +128,16 @@ class OpticalChannel(Channel):
     _MIN_POLL_INTERVAL = 1e-3
 
     # Fixed width (bytes, big-endian) of the per-frame rolling nonce prefixed to
-    # every channel_frame. 1 byte (mod-256 period) is sufficient because the
-    # windowed de-dup below (_DEDUP_DEPTH) is far shorter than the 256-frame wrap
-    # period, so a wrapped nonce can never collide inside the comparison window —
-    # this removes M8-review 권장 3's wrap risk without widening. Keeping it 1 byte
-    # also avoids shifting QR content into cv2's content-dependent detector blind
-    # spots (widening deterministically broke decoding of one session frame). The
-    # framing is parameterized by this constant, so it can be raised later with no
-    # other code change if a longer guaranteed-unique period is ever needed.
-    _NONCE_BYTES = 1
+    # every channel_frame. 2 bytes (mod-65536 period) since M10. The windowed
+    # de-dup below (_DEDUP_DEPTH=8) already made M8-review 권장 3's wrap-collision
+    # corner practically unreachable, but only a wider nonce removes it
+    # arithmetically. M9 had to stay at 1 byte because widening shifted QR content
+    # into cv2's content-dependent detector blind spot (broke one session frame);
+    # M10's hardened decoder (qr.decode preprocessing cascade + alternate-detector
+    # fallback) removes that constraint — re-validated at 2 bytes with a 100%
+    # 1B-vs-2B decode-rate sweep and a green full suite. The framing is
+    # parameterized by this constant, so the width can change in one place.
+    _NONCE_BYTES = 2
 
     # Number of recently delivered channel_frames retained for re-capture de-dup.
     # A small bounded window (not just the single last-delivered frame) makes
@@ -161,8 +166,22 @@ class OpticalChannel(Channel):
         :param scale: QR module pixel size, passed to :func:`encode_frame`.
         :param border: QR quiet-zone width in modules, passed to
             :func:`encode_frame`.
-        :param error: QR error-correction level (segno notation), passed to
-            :func:`encode_frame`.
+        :param error: QR error-correction level in segno notation
+            (``"l"``, ``"m"``, ``"q"``, ``"h"``), passed straight through to
+            :func:`encode_frame`. This is the channel's main *optical robustness*
+            knob and trades capacity for camera-capture resilience: a higher level
+            adds more redundancy so the decoder tolerates more damaged/occluded
+            modules (``"q"`` ≈ ~25% recovery vs the default ``"m"`` ≈ ~15%), which
+            measurably helps a real screen→camera link where glare, blur, and
+            partial occlusion corrupt modules. The cost is that the same payload
+            needs more codewords, so segno may pick a *larger* QR version (more
+            modules) and the single-symbol capacity drops — i.e.
+            :class:`~photontcp.qr.encode.QRCapacityError` triggers at a smaller
+            payload than at ``"m"``. The default stays ``"m"`` for backward
+            compatibility (existing callers and the in-memory pair are byte- and
+            behaviour-identical); real hardware links may raise it to ``"q"`` to
+            buy capture robustness, sizing packets to stay within the lower
+            ``"q"`` capacity.
         :param poll_interval: Seconds the capture thread waits per
             :meth:`CameraSource.read` poll. Also bounds how promptly the thread
             notices :meth:`close` (it loops at most this often). A value ``<= 0``
@@ -244,7 +263,14 @@ class OpticalChannel(Channel):
         :param scale: QR module pixel size, passed to :func:`encode_frame`.
         :param border: QR quiet-zone width in modules, passed to
             :func:`encode_frame`.
-        :param error: QR error-correction level, passed to :func:`encode_frame`.
+        :param error: QR error-correction level (segno notation:
+            ``"l"``/``"m"``/``"q"``/``"h"``) forwarded to both endpoints'
+            :func:`encode_frame`. Higher levels (``"q"`` ≈ ~25% recovery vs the
+            default ``"m"`` ≈ ~15%) make the optical capture more robust at the
+            cost of capacity — a larger QR version for the same payload, so
+            :class:`~photontcp.qr.encode.QRCapacityError` triggers sooner. The
+            default stays ``"m"`` for backward compatibility; real links raise it
+            to ``"q"`` (see :meth:`__init__` for the full tradeoff).
         :param poll_interval: Capture-thread poll interval for both endpoints.
         :param hold: Display-pacing minimum interval (seconds) forwarded to both
             endpoints' :meth:`send_frame`. Defaults to ``0`` (no pacing), so the

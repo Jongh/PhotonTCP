@@ -37,6 +37,7 @@ from photontcp.optical.devices import (  # noqa: E402
     MemoryDisplay,
     memory_device_pair,
 )
+from photontcp.qr.decode import decode_frame  # noqa: E402
 
 # Packet-sized payloads (cv2 cannot localize a QR from a tiny payload).
 PAYLOAD = b"photon-pacing-frame-" + bytes(range(64))
@@ -53,13 +54,24 @@ P_C = b"photon-pacing-C-" + bytes(range(128, 192))
 def test_hold_paces_sends_and_zero_holds_nothing() -> None:
     """``hold`` enforces a minimum gap between displays; ``hold=0`` adds none.
 
-    Compares the wall-clock cost of the same number of sends with and without
-    pacing: the paced run must be slower by at least (n-1) * hold (minus slack),
-    and the unpaced run must not pay that. Done relatively so the absolute encode
-    cost cancels out and the test is not sensitive to machine speed.
+    Uses two independent *one-sided* bounds against the pacing floor
+    ``(n-1) * hold`` (the total sleep a paced run must perform):
+
+    * the paced run cannot finish faster than that floor — :func:`time.sleep` is a
+      hard lower bound (it never returns early), so this holds regardless of
+      machine speed or suite load;
+    * the unpaced run pays only per-frame encode cost (tens of ms here), which is
+      far below the floor (200 ms), so it must finish under it.
+
+    Both bounds compare to the same ``floor * 0.9`` value (0.9 absorbs monotonic
+    granularity), with the paced run provably above and the unpaced run provably
+    below it by a wide margin. This avoids the earlier *differential* check
+    (``paced - unpaced``), which was flaky because per-frame encode cost varies
+    run-to-run and could swamp a small pacing budget.
     """
-    n = 4
+    n = 5
     hold = 0.05
+    floor = (n - 1) * hold  # total sleep the paced run must perform (0.20 s)
 
     a0, b0 = OpticalChannel.pair(hold=0.0)
     try:
@@ -81,12 +93,11 @@ def test_hold_paces_sends_and_zero_holds_nothing() -> None:
         a1.close()
         b1.close()
 
-    # The paced run inserts (n-1) gaps of `hold`; allow generous slack for timer
-    # granularity but require most of the expected pacing to be present. This is a
-    # *differential* check: both runs pay the same per-frame encode cost, so the
-    # gap isolates the pacing and is robust to machine speed / suite load (an
-    # absolute bound on `unpaced` would be flaky under contention).
-    assert paced - unpaced >= (n - 1) * hold * 0.7
+    # hold=0 must NOT pace: encode-only cost is far below the pacing floor.
+    assert unpaced < floor * 0.9
+    # hold>0 enforces the floor: the (n-1) sleeps cannot return early, so the
+    # paced run cannot finish faster than the floor (minus monotonic slack).
+    assert paced >= floor * 0.9
 
 
 # --------------------------------------------------------------------------- #
@@ -192,3 +203,31 @@ def test_out_of_order_recapture_is_deduped_without_dropping_new_frames() -> None
         assert rx.recv_frame(timeout=0.3) is None
     finally:
         rx.close()
+
+
+# --------------------------------------------------------------------------- #
+# 4. Two-byte nonce framing (M10 widening re-validation) — criterion 7.
+# --------------------------------------------------------------------------- #
+
+
+def test_nonce_framing_is_two_bytes_and_increments() -> None:
+    """M10 raised the channel-framing nonce from 1 to 2 bytes; pin that here.
+
+    M9 kept the nonce at 1 byte because widening shifted QR content into cv2's
+    content-dependent decoder blind spot. M10 hardened the decoder
+    (:func:`~photontcp.qr.decode.decode_frame` preprocessing cascade + alternate
+    detector), decoupling the nonce width from QR content, so the width was raised
+    to 2 (mod-65536 period) — removing the theoretical wrap-collision corner
+    *arithmetically*, not just practically. Each displayed ``channel_frame`` must
+    now be ``nonce.to_bytes(2, "big") + payload`` with the nonce advancing
+    0, 1, 2, ... per successful send.
+    """
+    assert OpticalChannel._NONCE_BYTES == 2
+
+    payloads = [P_A, P_B, P_C]
+    images = _encode_channel_frames(payloads)
+    for i, (img, payload) in enumerate(zip(images, payloads)):
+        channel_frame = decode_frame(img)
+        assert channel_frame is not None  # hardened decoder recovers every frame
+        assert channel_frame[:2] == i.to_bytes(2, "big")  # 2-byte big-endian nonce
+        assert channel_frame[2:] == payload  # payload intact after the nonce
