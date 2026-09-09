@@ -87,10 +87,16 @@ def _frame_to_array(
         is a flat buffer or a 1-D array; ignored for already-shaped arrays.
     :param colorfmt: The buffer's pixel format, one of :data:`_CHANNELS`.
     :param flip_vertical: Flip rows. Needed when the source hands out pixels in
-        GL (bottom-up) order — a *mirrored* QR does not decode, so this must be
-        right on real hardware. **확인 필요**: which row order
-        ``camera4kivy``'s ``analyze_pixels_callback`` delivers is not verified
-        here (no device available); the default is "as given".
+        GL (bottom-up) order. **This is NOT required for decoding** (M13
+        measurement): ``cv2.QRCodeDetector`` reads a QR under 90/180/270°
+        rotation *and* under horizontal/vertical mirroring — all seven variants
+        decoded, the base detector alone sufficing. Earlier revisions of this
+        docstring claimed a mirrored QR cannot be decoded; that was wrong. The
+        flags remain a normalisation knob rather than a correctness requirement
+        **for the shipped cv2 backend**. That scope matters: the decoder is a
+        registerable seam (:func:`~photontcp.qr.decode.register_decoder_backend`),
+        and a third-party backend need not share cv2's tolerance — so keep the
+        orientation sane rather than relying on the detector to forgive it.
     :param flip_horizontal: Flip columns — for a front ("selfie") camera whose
         preview is mirrored. Same caveat.
     :returns: A 2D ``uint8`` gray image or an ``HxWx3`` ``uint8`` BGR image

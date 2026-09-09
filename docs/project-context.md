@@ -32,7 +32,7 @@
 |---|---|
 | `channel/` | 채널 추상 `Channel` + `LoopbackChannel`·`ImageLoopbackChannel`(가상) |
 | `optical/` | 실물 광학 채널 `OpticalChannel` + `DisplaySink`/`CameraSource` 추상 + `Cv2Display`/`Cv2Camera` + 하드웨어 없는 피어 드라이버 `run_peer`/`PeerResult`(`peer.py` — 핸드셰이크→채팅→종료를 한 자리에서 몰고 `on_event`로 진행을 알린다) |
-| `qr/` | bytes ↔ QR 프레임 인코드/디코드 (`decode_frame`은 전처리 캐스케이드 + 대체 detector 폴백) |
+| `qr/` | bytes ↔ QR 프레임 인코드/디코드 (`decode_frame`은 전처리 캐스케이드 + 대체 detector 폴백). 디코더 백엔드 seam 공개 API: `register_decoder_backend` / `set_decoder_backend` / `active_decoder_backend` / `reset_decoder_backend_probe`(cv2 부재 캐시 무효화 — cv2 는 지연 import 되고 부재만 캐시된다) |
 | `packet/` | 헤더 직렬화 · 패킷 타입 · CRC32 |
 | `reliability/` | 슬라이딩 윈도우 ARQ · 재전송 · RTO 추정 · 직렬화 |
 | `session/` | SYN/SYN_ACK/ACK 핸드셰이크 · FIN 종료 · 하트비트 · 상태머신 · 클록 |

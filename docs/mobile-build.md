@@ -12,7 +12,7 @@ PhotonTCP를 안드로이드 폰에 올려 **한 피어로** 돌리기 위한 �
 
 ---
 
-## 0. 빌드 전 사전조건 — 확인 하나, 준비 하나
+## 0. 빌드 전 사전조건 — 확인 하나, 준비 둘
 
 **빌드를 시작하기 전에 아래 하니스를 먼저 돌려라.** 이 절과 1·2절의 사전조건을 한 번에
 점검해서 무엇이 준비됐고 무엇이 막혀 있는지를 표로 내놓는다(M12-T01).
@@ -31,8 +31,8 @@ python examples/mobile_build_preflight.py
   통과이고, 둘 다 없을 때만 `BLOCK`이다.
 - `BLOCK`이 뜬 항목의 대처 명령은 출력 하단 `What to do` 절에 그대로 찍힌다.
 
-`buildozer.spec`만으로는 빌드가 되지 않는다. 아래 0-1은 **이미 저장소에 있으니 확인만**
-하면 되고, 0-2는 **빌드 직전에 직접 만들어야** 한다.
+`buildozer.spec`만으로는 빌드가 되지 않는다. 0-1은 **이미 저장소에 있으니 확인만** 하면 되고,
+0-2와 0-3은 **직접 준비해야** 한다. **0-3(p4a 패치)을 건너뛰면 빌드는 반드시 실패한다.**
 
 ### 0-1. 진입점 `main.py` — 이미 저장소에 있다 (확인만)
 
@@ -73,6 +73,41 @@ rm -rf camerax_provider/.git
 
 > `camerax_provider/`는 서드파티 산출물이므로 이 저장소에 커밋하지 않는다.
 > 빌드 환경마다 위 두 줄을 다시 실행한다.
+
+### 0-3. p4a 패치 — **빌드가 성립하려면 반드시 필요하다**
+
+`tools/p4a-android-wheel-url.patch`를 적용하지 않으면 빌드는 **반드시 실패한다**(상류 버그,
+상세는 5-4절). 다만 **순서에 함정이 있다**: 패치 대상인 p4a는 **buildozer가 빌드 중에 clone**
+하므로 깨끗한 체크아웃에는 그 디렉터리가 **없다.** 따라서 실제 순서는 이렇다.
+
+```bash
+# 1) 한 번 빌드를 돌린다 — p4a 를 clone 하는 것이 목적이다.
+#    (레시피 빌드까지 진행하다 순수 파이썬 의존성 설치 단계에서 실패한다. 정상이다.)
+MSYS_NO_PATHCONV=1 docker run -d --name photontcp-build --memory=6g     --volume photontcp-buildozer:/home/user/.buildozer     --volume "$PWD":/home/user/hostcwd     kivy/buildozer android debug
+docker logs -f photontcp-build      # "not a supported wheel on this platform" 에서 멈추면 예정대로다
+
+# 2) clone 된 p4a 에 패치를 적용한다.
+cd .buildozer/android/platform/python-for-android
+git apply ../../../../tools/p4a-android-wheel-url.patch
+# 이미 적용됐는지 확인:  git apply --check --reverse ../../../../tools/p4a-android-wheel-url.patch
+cd -
+
+# 3) 재실행 전에 venv 를 지운다 (5-6절 — 재실행 시 pip 이 섞인다).
+rm -rf .buildozer/android/platform/build-arm64-v8a/build/venv
+
+# 4) 다시 빌드한다. 이번엔 끝까지 간다.
+docker rm -f photontcp-build
+MSYS_NO_PATHCONV=1 docker run -d --name photontcp-build --memory=6g     --volume photontcp-buildozer:/home/user/.buildozer     --volume "$PWD":/home/user/hostcwd     kivy/buildozer android debug
+```
+
+> **왜 `p4a.source_dir`를 쓰지 않는가**: 마일스톤은 패치된 p4a 체크아웃을 `p4a.source_dir`로
+> 가리키는 배선을 상정했으나 M13은 그렇게 하지 않았다 — 그 배선은 **빌드로만 검증되는 변경**이라
+> 이번 사이클의 성공한 빌드 구성을 흔들지 않으려 보류했다. 그 대가가 위 4단계이고,
+> `.buildozer/`는 `.gitignore` 대상이라 **캐시를 지우면 패치도 함께 사라진다**(그때는 2·3단계를
+> 다시 밟는다). 배선을 정식화하는 것은 후속 항목이다.
+
+> **사전조건 하니스는 이 항목을 보지 않는다.** `mobile_build_preflight.py`가 `READY`를 내도
+> 패치가 적용되지 않았다면 빌드는 실패한다 — 하니스는 툴체인·스펙·경로만 점검한다.
 
 ---
 
@@ -165,11 +200,11 @@ docker rm -f photontcp-build            # 끝난 뒤 정리 (캐시 volume 은 �
 **2) NDK 사전 추출** — 첫 빌드가 `unzip -q ...ndk...zip` exit 1로 멈추면 5-4절 ②의
 `unzip -o` 절차를 한 번 돌린 뒤 위 명령을 다시 실행한다.
 
-**PowerShell**:
+**PowerShell** (같은 형태 — named volume · detached · `--rm` 없음):
 
 ```powershell
-docker run --interactive --tty --rm `
-    --volume "$env:USERPROFILE\.buildozer:/home/user/.buildozer" `
+docker run -d --name photontcp-build --memory=6g `
+    --volume photontcp-buildozer:/home/user/.buildozer `
     --volume "${PWD}:/home/user/hostcwd" `
     kivy/buildozer android debug
 ```
@@ -503,38 +538,93 @@ docker logs -f photontcp-build
 > `ImportError: cannot import name 'BuildDependencyInstallError'`가 난다. 그 venv를
 > 지우고 다시 돌리면 해소된다(`site-packages`에 `pip-*.dist-info`가 둘이면 이 상태다).
 
-**5 — 미해결: p4a의 안드로이드 휠 URL (APK 미산출의 직접 원인).**
+**5 — 해결됨(M13-T01): p4a의 안드로이드 휠 URL.**
 
 p4a는 레시피 없는 순수 파이썬 요구사항의 의존성을 해석할 때, PyPI에 **안드로이드 전용
-휠**이 있으면 그 휠의 URL을 요구사항 목록에 집어넣는다. 그러나 설치는
+휠**이 있으면 그 휠의 URL을 요구사항 목록에 넣는다. 그러나 설치는
 `--platform`/`--only-binary` 없이 **호스트 pip**으로 실행하므로
-(`pythonforandroid/build.py:927`) 자기가 넣은 요구사항을 스스로 거부한다:
+(`pythonforandroid/build.py`) 자기가 넣은 요구사항을 스스로 거부한다:
 
 ```
-[INFO]: The requirements (camera4kivy, certifi, chardet, filetype, gestures4kivy,
-        idna, requests, segno, six, urllib3,
-        https://files.pythonhosted.org/.../charset_normalizer-3.5.1-cp314-cp314-android_24_arm64_v8a.whl)
-        don't have recipes, attempting to install them with pip
--> running venv/bin/pip install -v --target '.../python-installs/photontcp/arm64-v8a' \
-       --no-deps -r requirements.txt
 ERROR: charset_normalizer-3.5.1-cp314-cp314-android_24_arm64_v8a.whl
        is not a supported wheel on this platform.
 ```
 
-걸리는 경로는 **camera4kivy → requests → charset-normalizer**이고, 그 의존성 묶음에서
-컴파일 확장을 가진 것이 charset-normalizer 하나뿐이라 그것만 터진다.
+**우회는 `tools/p4a-android-wheel-url.patch`다** — 설치 단계에 해석 단계와 같은 platform
+태그를 넘겨 두 단계의 가정을 일치시키는 34줄 diff. 빌드 전에 clone된 p4a에 적용한다:
 
-**시도했고 듣지 않은 우회 둘**(둘 다 실측):
+```bash
+cd .buildozer/android/platform/python-for-android
+git apply ../../../../tools/p4a-android-wheel-url.patch
+# 이미 적용됐는지 확인: git apply --check --reverse ../../../../tools/p4a-android-wheel-url.patch
+```
 
-- `requirements`에 `charset-normalizer==3.3.2` 핀 → p4a가 핀과 **무관하게** 3.5.1 휠
-  URL을 따로 덧붙인다(요구사항 목록에 둘 다 등장).
-- `p4a.extra_args = --skip-prebuilt` → 인자는 전달됐지만(p4a 명령줄에서 확인) 효과 없음.
-  그 옵션은 `Recipe.check_prebuilt()`만 끄므로 **레시피**의 프리빌트 휠에만 관여한다.
+적용 후 순수 파이썬 의존성 11개가 정상 설치된다(M13-T01 실측):
+`camera4kivy-0.3.3 certifi-2026.7.22 chardet-7.6.0 charset-normalizer-3.5.1 filetype-1.2.0
+gestures4kivy-0.1.4 idna-3.19 requests-2.34.2 segno-1.6.6 six-1.17.0 urllib3-2.7.0`
 
-**남은 경로**(다음 사이클): 상류 수정(p4a의 pip 호출에 `--platform`/`--only-binary` 추가),
-`p4a.fork`/`p4a.branch`로 그 경로가 없는 리비전 고정, 또는 `p4a.source_dir`로 패치한
-p4a 체크아웃 지정. 어느 쪽이든 **우리 코드의 문제가 아니다** — opencv를 포함한 모든
-네이티브 레시피는 이 지점 **전에** 이미 성공적으로 컴파일된다(아래).
+**p4a 리비전 고정(`p4a.branch`)은 대안이 아니다** — 문제 기능(커밋 `2f107b15`, 2026-03-28)을
+포함하지 않는 가장 최근 릴리즈가 `v2024.01.21`로 약 2년 전이라 Python 3.14 / NDK r28c /
+buildozer 1.6.1 조합을 지원하지 못한다.
+
+### 5-5. **조용한 파국** — 빌드가 성공했는데 APK에 앱 코드가 없다 (M13-T01)
+
+위 5를 우회한 뒤 빌드가 **exit 0으로 성공하고 43MB APK가 나왔는데, 그 안에 `photontcp/`가
+한 파일도 없었다.** `main.pyc`는 `from photontcp.mobile.app import main`을 하므로 기기에서
+즉시 죽는다. 빌드 로그에는 오류가 **하나도 없다.**
+
+기전 — p4a `bootstraps/common/build/build.py`:
+
+```python
+use_setup_py = dist_info 의 값          # 이 dist 에서는 True 로 기록돼 있었다
+if not use_setup_py or (setup.py 없음 and pyproject.toml 없음):
+    private_tar_dirs.append(args.private)   # 앱 코드 전체를 담는다
+else:
+    "Copying main.py's ONLY, since other app data is expected in site-packages."
+```
+
+`source.dir`에 **`pyproject.toml`이 보이기만 해도** p4a는 "앱은 site-packages에 설치돼
+있겠지"라고 판단해 `main.py` 하나만 담는다. 그런데 buildozer는 `--ignore-setup-py`를
+넘기므로 **그 설치는 일어나지 않는다.**
+
+**대처**: `source.include_exts`에서 `toml`을 뺀다(그래서 `pyproject.toml`이 스테이징
+디렉터리로 복사되지 않는다). M11-review 사소 14가 기기의 `__version__`을 위해 `toml`을 넣었었는데, 그
+편의는 동작하지 않는 APK와 맞바꿀 수 없다 — 기기에서 `__version__`은 `"0+unknown"`이 된다.
+
+**검증 방법(중요)** — APK가 나왔다고 끝이 아니다. 다음을 확인한다:
+
+```bash
+python - <<'EOF'
+import zipfile, tarfile, io
+z = zipfile.ZipFile("bin/photontcp-<버전>-arm64-v8a-debug.apk")
+t = tarfile.open(fileobj=io.BytesIO(z.read("assets/private.tar")))
+ph = [n for n in t.getnames() if "photontcp" in n]
+print("photontcp 엔트리:", len(ph))          # 0 이면 앱 코드 없음 = 실패
+b = tarfile.open(fileobj=io.BytesIO(z.read("lib/arm64-v8a/libpybundle.so"))).getnames()
+print("cv2.so:", sum(1 for n in b if "cv2.so" in n))   # 디코더가 들어갔는가
+EOF
+```
+
+M13-T01의 최종 APK 실측: private.tar 52 엔트리 중 **photontcp 46건**(`mobile/app.pyc`
+포함), `libpybundle`에 `cv2.so`·segno·camera4kivy·charset_normalizer·numpy 전부 존재.
+
+### 5-6. 재실행 시 venv pip 혼재 (M13-T01에서 원인 정정)
+
+M12는 이 증상을 *"컨테이너가 OOM으로 죽으며 남긴 2차 피해"* 로 기록했으나 **틀렸다.**
+M13에서 OOM 없이 재발했다. 실제 원인은 **재실행 자체**다 — 빌드를 다시 돌리면
+`python -m venv venv`가 기존 venv에 번들 pip(25.3)을 다시 깔고, 그 위에 이미 업그레이드된
+pip(26.2.1) 파일이 남아 섞인다:
+
+```
+ImportError: cannot import name 'BuildDependencyInstallError' from 'pip._internal.exceptions'
+```
+
+**대처**: 빌드를 재실행하기 전에 그 venv를 지운다(`site-packages`에 `pip-*.dist-info`가
+둘이면 이 상태다).
+
+```bash
+rm -rf .buildozer/android/platform/build-arm64-v8a/build/venv
+```
 
 **여기까지는 성공했다(실측):** SDK cmdline-tools 6514223 · NDK r28c · buildozer
 1.6.1.dev0 · 레시피 hostpython3 · libffi · openssl · sqlite3 · python3 · sdl2(+image·

@@ -180,3 +180,88 @@ def test_cv2_guard_still_holds() -> None:
         "print(repr((has_attr, present == listed)))\n"
     )
     assert out.strip() == "(True, True)"
+
+
+# --------------------------------------------------------------------------- #
+# 4. 서브모듈 속성 접근 복원 (M13-T02, M12-review 사소 8 / 완료 기준 1-⑴)
+# --------------------------------------------------------------------------- #
+
+
+def test_submodule_attribute_access_is_restored_and_stays_lazy() -> None:
+    """``o.peer`` 가 되살아났고 **그럼에도** 상위 계층은 끌려오지 않는다.
+
+    M12-T03 의 지연 재수출은 ``run_peer``·``PeerResult`` 두 이름만 처리해, HEAD 에서
+    ``from .peer import …`` 의 부작용으로 존재하던 ``photontcp.optical.peer``
+    **속성 접근**을 조용히 없앴다(M12-review 사소 8). ``__getattr__`` 의 서브모듈
+    폴백이 그것을 복원한다.
+
+    **한 테스트가 둘을 함께 단언한다**(완료 기준 1): 복원이 지연 성질을 되돌리지
+    않았음을 한 자리에서 증명해야 하기 때문이다 — 폴백을 eager import 로 바꾸면
+    ⑵ 가, 폴백을 지우면 ⑴ 이 붉는다.
+    """
+    out = _run_ok(
+        "import sys\n"
+        "import photontcp.optical as opt\n"
+        # ⑵ 패키지 import 직후: 상위 계층도 peer 도 아직 없다.
+        "leaked_before = [n for n in ('photontcp.app', 'photontcp.session',"
+        " 'photontcp.optical.peer') if n in sys.modules]\n"
+        # ⑴ 속성 접근이 AttributeError 를 내지 않고 서브모듈을 돌려준다.
+        "mod = opt.peer\n"
+        "import photontcp.optical.peer as peer_mod\n"
+        "same = mod is peer_mod\n"
+        "cached = getattr(opt, 'peer', None) is peer_mod\n"
+        "print(repr((leaked_before, same, cached)))\n"
+    )
+    assert out.strip() == "([], True, True)", out
+
+
+def test_submodule_fallback_does_not_import_arbitrary_names() -> None:
+    """폴백은 **실제 서브모듈일 때만** 돈다 — 아무 이름이나 import 하지 않는다.
+
+    ``photontcp.optical.<name>`` 이 존재하지 않으면 종전대로 ``AttributeError`` 이고,
+    ``sys.modules`` 에 무언가가 새로 생기지도 않는다.
+    """
+    out = _run_ok(
+        "import sys\n"
+        "import photontcp.optical as opt\n"
+        "before = set(sys.modules)\n"
+        "try:\n"
+        "    opt.json\n"  # 최상위에 실재하지만 이 패키지의 서브모듈은 아니다
+        "except AttributeError:\n"
+        "    raised_json = True\n"
+        "else:\n"
+        "    raised_json = False\n"
+        "try:\n"
+        "    opt.definitely_not_here\n"
+        "except AttributeError:\n"
+        "    raised_unknown = True\n"
+        "else:\n"
+        "    raised_unknown = False\n"
+        "new = sorted(n for n in set(sys.modules) - before"
+        " if n.startswith('photontcp'))\n"
+        "print(repr((raised_json, raised_unknown, new)))\n"
+    )
+    assert out.strip() == "(True, True, [])", out
+
+
+def test_all_optical_submodules_are_reachable_as_attributes() -> None:
+    """``channel``·``devices``·``peer`` 등 서브모듈 전부가 속성으로 잡힌다.
+
+    사소 8 이 없앤 것은 ``peer`` 하나였지만, 폴백은 이름을 하나만 특별대우하지
+    않는다 — 패키지의 모든 서브모듈에 대해 종전 형태가 성립한다.
+    """
+    out = _run_ok(
+        "import pkgutil\n"
+        "import photontcp.optical as opt\n"
+        "names = sorted(m.name for m in pkgutil.iter_modules(opt.__path__))\n"
+        "missing = []\n"
+        "for n in names:\n"
+        "    try:\n"
+        "        getattr(opt, n)\n"
+        "    except AttributeError:\n"
+        "        missing.append(n)\n"
+        "    except ImportError:\n"
+        "        pass\n"  # cv2 부재 머신의 cv2_devices — 가드 성질은 별도 테스트
+        "print(repr((bool(names), missing)))\n"
+    )
+    assert out.strip() == "(True, [])", out

@@ -93,7 +93,11 @@ class _StubWidget:
     def clear_widgets(self):  # noqa: D102
         self.children = []
 
-    def bind(self, **_kwargs):  # noqa: D102
+    def bind(self, **kwargs):  # noqa: D102
+        # 배선을 관찰 가능하게 기록만 한다 (기존 동작은 그대로 no-op).
+        if not hasattr(self, "bound_events"):
+            self.bound_events = {}
+        self.bound_events.update(kwargs)
         return None
 
 
@@ -562,3 +566,120 @@ def test_make_preview_reason_is_what_the_status_line_would_show(
     _preview, error = app_module._make_preview(camera=None, facing="front")
     assert "\n" not in error
     assert error.strip() == error
+
+
+# --------------------------------------------------------------------------- #
+# 8. build() — 위젯 트리 구성 + 폐기예정 속성 가드 (M13-T03)
+# --------------------------------------------------------------------------- #
+
+#: ``build()`` 가 부르는 위젯 생성자 이름들. 전부 대역으로 바꿔치기하므로 이
+#: 절의 단언은 Kivy 설치 여부와 무관하게(그리고 GL 컨텍스트 없이) 돈다 —
+#: 실물 Kivy 에서 ``build()`` 를 그대로 부르면 Window/GL 이 필요하다.
+_WIDGET_NAMES = ("BoxLayout", "Button", "Image", "Label", "Spinner", "TextInput")
+
+
+class _RecordingWidget(_StubWidget):
+    """생성자 키워드를 **그대로 보관**하는 위젯 대역.
+
+    ``qr_image`` 가 어떤 키워드로 만들어졌는지를 관찰 가능하게 만드는 것이
+    목적이다 — 실물 ``kivy.uix.image.Image`` 는 ``fit_mode`` 와 폐기예정
+    ``allow_stretch``/``keep_ratio`` 를 **셋 다** 속성으로 갖고 있어서,
+    인스턴스를 들여다보는 것만으로는 무엇을 넘겼는지 알 수 없다.
+    """
+
+    def __init__(self, **kwargs):
+        self.init_kwargs = dict(kwargs)
+        super().__init__(**kwargs)
+
+
+@pytest.fixture
+def built(app_module, monkeypatch):
+    """``build()`` 를 대역 위젯 위에서 돌리고 ``(app, root)`` 를 준다."""
+    for name in _WIDGET_NAMES:
+        monkeypatch.setattr(
+            app_module, name, type(f"_Rec{name}", (_RecordingWidget,), {})
+        )
+    instance = app_module.PhotonTCPApp()
+    return instance, instance.build()
+
+
+def test_build_constructs_the_expected_widget_tree(built) -> None:
+    """설정 행 / QR 영역 + 프리뷰 슬롯 / 상태 줄 / Start·Stop 이 모두 선다."""
+    app_instance, root = built
+
+    settings, middle, status, buttons = root.children
+
+    assert settings.children == [
+        app_instance.role_spinner,
+        app_instance.scale_input,
+        app_instance.hold_input,
+        app_instance.facing_spinner,
+    ]
+    assert middle.children == [app_instance.qr_image, app_instance.preview_slot]
+    assert status is app_instance.status_label and status.text
+    assert buttons.children == [app_instance.start_button, app_instance.stop_button]
+    assert (app_instance.start_button.text, app_instance.stop_button.text) == (
+        "Start",
+        "Stop",
+    )
+    assert app_instance.stop_button.disabled is True
+
+
+def test_qr_image_uses_fit_mode_not_the_deprecated_pair(built) -> None:
+    """QR 위젯은 ``fit_mode`` 로 만들어지고 폐기예정 속성을 넘기지 않는다.
+
+    Kivy 2.3.1 은 ``allow_stretch``/``keep_ratio`` 에 *"will be removed in a
+    future version"* 경고를 낸다. 대체는 ``fit_mode="contain"``(Kivy 2.2+)이며,
+    p4a 의 kivy 레시피가 2.3.1 을 고정하므로 실기에서도 존재한다. 둘 중 하나라도
+    되살아나면 이 단언이 붉어진다.
+
+    ``"contain"`` 인 것까지 못 박는 이유: ``"fill"``/``"scale-down"`` 은 QR 을
+    늘리거나 축소를 막아 디코드를 깨뜨릴 수 있다 — 구 조합
+    (``allow_stretch=True, keep_ratio=True``)과 등가인 것은 ``"contain"`` 뿐이다.
+    """
+    app_instance, _root = built
+    kwargs = app_instance.qr_image.init_kwargs
+
+    assert kwargs.get("fit_mode") == "contain"
+    assert "allow_stretch" not in kwargs
+    assert "keep_ratio" not in kwargs
+
+
+# --------------------------------------------------------------------------- #
+# 9. Kivy 라이프사이클 이벤트 이름과의 충돌 (M13 — 계획 밖 발견)
+# --------------------------------------------------------------------------- #
+
+
+def test_start_handler_does_not_shadow_the_kivy_lifecycle_event(app_module) -> None:
+    """``PhotonTCPApp`` 은 ``on_start`` 를 **정의하면 안 된다**.
+
+    Kivy 의 ``App.run()`` 은 기동 중 ``self.dispatch('on_start')`` 를 부른다.
+    그래서 그 이름으로 메서드를 두면 **프레임워크가 창을 여는 순간 그것을 실행**한다.
+    M13 이전에 이 클래스가 실제로 ``on_start`` 를 Start 버튼 핸들러로 정의하고 있었고,
+    그 결과 **아무도 Start 를 누르지 않았는데 카메라 권한 요청과 핸드셰이크가 시작**됐다
+    (데스크톱 실행에서 실측). 그 자체로 잘못이고, 실기 스모크 관찰도 오염시킨다.
+
+    ``on_stop`` 은 **의도적 예외**다 — 프레임워크의 종료 훅과 Stop 버튼이 같은 일을
+    원하므로 이름을 공유하는 것이 맞고, 그 사유가 해당 메서드 docstring 에 적혀 있다.
+    """
+    app_cls = app_module.PhotonTCPApp
+    assert "on_start" not in vars(app_cls), (
+        "PhotonTCPApp 이 on_start 를 정의했다 — Kivy 가 기동 시 이것을 디스패치하므로 "
+        "세션이 저절로 시작된다. 버튼 핸들러는 on_start_pressed 처럼 다른 이름을 쓴다."
+    )
+    assert callable(getattr(app_cls, "on_start_pressed", None)), (
+        "Start 버튼 핸들러 on_start_pressed 가 없다"
+    )
+    # on_stop 은 반대로 **의도적으로** 정의돼 있어야 한다(종료 훅 겸용).
+    assert "on_stop" in vars(app_cls)
+
+
+def test_start_button_is_bound_to_the_renamed_handler(built) -> None:
+    """개명이 배선까지 갔는가 — Start 버튼이 ``on_start_pressed`` 에 묶인다."""
+    app_instance, _ = built
+    handler = getattr(app_instance.start_button, "bound_events", {}).get("on_release")
+    assert handler is not None, "start_button 에 on_release 바인딩이 없다"
+    assert handler == app_instance.on_start_pressed
+    # Stop 은 종전대로 on_stop 에 묶인다(의도적 이중 역할).
+    stop_handler = getattr(app_instance.stop_button, "bound_events", {}).get("on_release")
+    assert stop_handler == app_instance.on_stop

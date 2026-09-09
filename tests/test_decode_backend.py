@@ -14,6 +14,18 @@
 백엔드 레지스트리, 선택된 백엔드 이름)를 건드리므로 모든 변경을 fixture 로
 감싸 되돌린다. 등록 해제 공개 API 가 없어 레지스트리는 dict 스냅샷으로
 복원한다(다른 테스트 모듈이 ``"cv2"`` 자동 선택에 의존하기 때문).
+
+.. warning::
+
+   **cv2 를 막는 테스트를 새로 쓴다면 여기를 먼저 읽어라** (M12-review 사소 9).
+   M12-T03 이 cv2 **부재** 를 프로세스 수명 동안 캐시하므로, 차단을 푼 뒤
+   :func:`~photontcp.qr.decode.reset_decoder_backend_probe` 를 부르지 않으면
+   **세션 전체가 캐시된 부재로 오염**되고 실패가 한참 뒤의 무관한 테스트에서 난다.
+   이 모듈의 :func:`blocked_cv2` 는 종료 시 그것을 부르고, 추가로
+   ``tests/conftest.py`` 의 autouse 안전망이 **차단 방식과 무관하게** 매 테스트
+   종료 시 같은 무효화를 수행한다. 그래도 새 헬퍼를 만들기보다 :func:`blocked_cv2`
+   를 재사용하는 편이 낫다 — ``lookups`` 카운터와 ``reset_on_exit`` 스위치가
+   음성 캐시 자체를 관찰하는 데 필요하기 때문이다.
 """
 
 from __future__ import annotations

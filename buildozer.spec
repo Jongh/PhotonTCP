@@ -30,15 +30,30 @@ package.domain = org.photontcp
 #         main()
 source.dir = .
 
-# (list) APK에 포함할 확장자. buildozer 기본값 + `toml`.
-# `.kv`를 쓰지 않더라도 남겨 두면 나중에 kv 파일을 추가할 때 스펙을 안 고쳐도 된다.
+# (list) APK에 포함할 확장자. buildozer 기본값 그대로 — **`toml` 을 넣으면 안 된다.**
 #
-# `toml`을 더한 이유(M11-review 사소 14): `photontcp/__init__.py`의 `__version__`은
-# 단일 원본인 `pyproject.toml`에서 파생되는데, 기기에는 dist metadata가 없으므로
-# 그 파일이 APK에 없으면 파생이 최종 폴백 `"0+unknown"`으로 떨어진다. 크래시는
-# 나지 않지만 "선언처가 하나"가 기기에서만 조용히 성립하지 않는 형태라, 파일을
-# 함께 담아 데스크톱과 같은 값을 내게 한다(파일 하나, 수백 바이트).
-source.include_exts = py,png,jpg,kv,atlas,toml
+# M11-review 사소 14 가 `pyproject.toml` 을 APK 에 담으려고 `toml` 을 더했었다(기기에서
+# `photontcp.__version__` 이 `"0+unknown"` 으로 떨어지는 것을 막으려는 의도). M13-T01 의
+# 실빌드에서 **그 한 줄이 앱 코드를 통째로 APK 에서 빼는 원인**임이 드러나 되돌린다.
+#
+# 기전(p4a `bootstraps/common/build/build.py`):
+#
+#     use_setup_py = dist_info 의 값        # 이 dist 에서는 True 로 기록돼 있다
+#     if not use_setup_py or (setup.py 없음 and pyproject.toml 없음):
+#         private_tar_dirs.append(args.private)      # 앱 코드 전체를 담는다
+#     else:
+#         "Copying main.py's ONLY, since other app data is expected in site-packages."
+#
+# 즉 `source.dir` 에 `pyproject.toml` 이 **보이기만 해도** p4a 는 "앱은 site-packages 에
+# 설치돼 있겠지"라고 판단해 `main.py` 하나만 담는다. 그런데 buildozer 는
+# `--ignore-setup-py` 를 넘기므로 그 설치는 **일어나지 않는다**. 결과는 조용한 파국이다 —
+# 빌드는 exit 0 으로 성공하고 43MB APK 가 나오지만 그 안에 `photontcp/` 가 없어
+# 기기에서 `main.py` 의 `from photontcp.mobile.app import main` 이 즉시 죽는다.
+# (M13-T01 실측: `libpybundle.so` 에 segno·camera4kivy·cv2 는 있는데 photontcp 는 0 건.)
+#
+# 잃는 것: 기기에서 `__version__` 이 `"0+unknown"` 이 된다. **감수한다** — 그 값은 어디에도
+# 쓰이지 않고, 대안은 동작하지 않는 APK 다.
+source.include_exts = py,png,jpg,kv,atlas
 
 # (list) 패키징에서 제외할 디렉터리. 테스트·문서·빌드 캐시·예제는 APK에 넣지 않는다.
 source.exclude_dirs = tests, docs, examples, bin, .buildozer, .git, .tide, .pytest_cache
@@ -182,31 +197,29 @@ p4a.hook = camerax_provider/gradle_options.py
 
 # (str) p4a 에 그대로 넘기는 추가 인자. **현재 비워 둔다.**
 #
-# M12-T05 에서 `--skip-prebuilt` 를 시도했으나 **효과가 없었다**(실측). 그 옵션은
-# `Recipe.check_prebuilt()` 만 끄므로 *레시피*의 프리빌트 휠에만 관여하고, 아래에 적은
-# 의존성 해석 경로가 만들어 내는 안드로이드 휠 URL 은 그대로 남는다. 인자가 실제로
-# 전달된 것은 로그의 p4a 명령줄에서 확인했다 — 즉 "안 먹힌" 것이지 "안 넘어간" 것이
-# 아니다. 되지 않는 우회를 켜 둔 채로 남기지 않기 위해 지운다.
+# M12-T05 에서 `--skip-prebuilt` 를 시도했으나 효과가 없었다(실측) — 그 옵션은
+# `Recipe.check_prebuilt()` 만 끄므로 *레시피*의 프리빌트 휠에만 관여한다. 아래 상류
+# 버그는 그것과 다른 경로라 인자로는 우회되지 않는다.
 #
-# ── 미해결 상류 버그 (M12-T05, APK 미산출의 직접 원인) ──
+# ── 상류 버그와 그 우회 (M13-T01 에서 해결) ──────────────────────────────────
 #
-# p4a 는 레시피 없는 순수 파이썬 요구사항의 의존성을 해석할 때, PyPI 에 **안드로이드
-# 전용 휠**이 있으면 그 휠의 URL 을 요구사항 목록에 집어넣는다. 그런데 설치는
-# `--platform`/`--only-binary` 없이 호스트 pip 으로 실행한다
-# (`pythonforandroid/build.py:927` — `venv/bin/pip install -v --target ... -r requirements.txt`).
-# 그래서 자기가 넣은 요구사항을 스스로 거부한다:
+# p4a 의 `process_python_modules()` 는 pip 을 `--platform=android_...` 로 돌려 의존성을
+# 해석하고, 그 판정을 통과한 휠의 **URL 을 요구사항 목록에 넣는다**(안드로이드 전용 휠도
+# 통과한다). 그런데 설치는 `run_pymodules_install()` 에서 **그 platform 태그 없이** 호스트
+# pip 으로 실행되므로, p4a 가 스스로 적어 넣은 요구사항을 스스로 거부한다:
 #
 #     ERROR: charset_normalizer-3.5.1-cp314-cp314-android_24_arm64_v8a.whl
 #            is not a supported wheel on this platform.
 #
-# 이 프로젝트가 걸리는 경로: camera4kivy -> requests -> charset-normalizer.
-# 그 묶음에서 컴파일 확장을 가진 것이 charset-normalizer 하나뿐이라 그것만 터진다
-# (certifi·idna·urllib3·six·filetype·chardet 은 순수 파이썬).
+# 이 프로젝트가 걸리는 경로는 camera4kivy -> requests -> charset-normalizer 다.
 #
-# 시도했고 듣지 않은 것 둘: `requirements` 에 `charset-normalizer==3.3.2` 핀
-# (p4a 가 핀과 무관하게 3.5.1 휠 URL 을 따로 덧붙인다), `--skip-prebuilt`(위).
-# 남은 경로는 상류 수정 또는 p4a 포크 고정이며 다음 사이클 항목이다.
-# 상세는 `docs/mobile-build.md` 5-4 절.
+# **우회는 `tools/p4a-android-wheel-url.patch` 다** — 설치 단계에 해석 단계와 같은
+# platform 태그를 넘겨 두 단계의 가정을 일치시키는 34 줄 diff. 빌드 전에 clone 된 p4a 에
+# 적용한다(절차는 `docs/mobile-build.md` 5-4). 상류가 고치면 패치는 불필요해진다.
+#
+# **p4a 리비전 고정(`p4a.branch`)은 대안이 되지 못한다**: 문제 기능(커밋 2f107b15,
+# 2026-03-28)을 포함하지 않는 가장 최근 릴리즈가 `v2024.01.21` 로 약 2 년 전이라
+# Python 3.14 / NDK r28c / buildozer 1.6.1 조합을 지원하지 못한다(M13-T01 실측 판단).
 #p4a.extra_args =
 
 [buildozer]

@@ -56,33 +56,39 @@ raises ``ImportError`` — same as :mod:`photontcp.mobile.kivy_devices`.
 ``import photontcp.mobile`` keeps working there, which is what M11 completion
 criterion 6 requires.
 
-확인 필요 (still unverified — no Android device, and no webcam on the dev machine)
-================================================================================
+실기 실측 (M13, 2026-09-09 — Galaxy S26 + Galaxy Tab S9 FE+)
+=============================================================
 
-M12-T02 ran this app on a **desktop** Kivy install (2.3.1 / SDL2 / OpenGL 4.6) and
-closed two of the items that used to be listed here:
+Confirmed on real Android hardware:
 
-* the widget tree builds and renders, and pressing Start with no ``camera4kivy``
-  ends in a status-line message rather than a crash;
-* ``Preview.connect_camera(enable_analyze_pixels=True, camera_id=…)`` accepts
-  those keyword names on camera4kivy 0.3.3 (no ``TypeError``).
+* the widget tree renders and the app survives a full session (Android 16,
+  Python 3.14.2, Kivy 2.3.1);
+* **Android GLES accepts the ``"luminance"`` texture** ``KivyDisplay`` uploads —
+  the on-screen QR was decoded straight off a screenshot by this project's own
+  ``decode_frame`` (Xclipse 960/ANGLE and Mali-G68 both);
+* the runtime CAMERA permission flow works (request -> grant -> session runs);
+* ``android.wakelock = True`` holds a ``SCREEN_BRIGHT_WAKE_LOCK`` while a
+  session runs (``dumpsys power``);
+* the camera path delivers frames — two devices completed a full bidirectional
+  session over light (``established`` / ``MATCH 2/2`` / ``closed`` on both).
 
-What is still unverified is below. The desktop machine had **no webcam**, so the
-pixel callback was never invoked, and Android's GLES backend is a separate
-question from the desktop one.
+**Orientation is NOT a correctness concern.** Earlier revisions of this file
+said a mirrored QR cannot be decoded and made ``flip_*`` the first thing to
+check on device. That was wrong: ``cv2.QRCodeDetector`` decodes 90/180/270°
+rotations *and* horizontal/vertical mirroring. Alignment (how large and how
+square-on the peer's QR lands in frame) is what actually decides the link.
 
-* ``camera4kivy``'s ``Preview.analyze_pixels_callback(self, pixels, image_size,
-  image_pos, scale, mirror)`` signature and its RGBA row order. The subclass
-  below absorbs signature drift with ``*args``/``**kwargs`` and only relies on
-  the first two parameters, but the *row order* (and therefore whether
-  ``flip_vertical`` must be set) is unverified.
-* Whether an Android GLES backend accepts the ``"luminance"`` texture format
-  ``KivyDisplay`` uploads by default (see that class's docstring). The **desktop**
-  GL backend does accept it (M12-T02); GLES is a separate implementation.
+확인 필요 (still unverified)
+===========================
+
+* ``camera4kivy``'s exact ``analyze_pixels_callback`` argument list. The path is
+  known to *work* (the session above ran through it), but the concrete signature
+  was never recorded on device; the subclass below still absorbs drift with
+  ``*args``/``**kwargs`` and binds only the first two parameters.
 * Whether CameraX/``camera4kivy`` **recycles** the analysis buffer after the
   callback returns. ``KivyCamera`` copies on submit by default
-  (``copy_on_submit``) so recycling cannot tear a frame either way; what is
-  unverified is only whether that copy is strictly necessary here.
+  (``copy_on_submit``), which makes the question moot for correctness — so the
+  device run could not distinguish the two cases.
 """
 
 from __future__ import annotations
@@ -299,10 +305,22 @@ class PhotonTCPApp(App):
 
         # --- QR display area (+ a small camera preview slot). ------------- #
         middle = BoxLayout(spacing=6)
-        # allow_stretch/keep_ratio keep the QR square and crisp-ish; nearest
+        # ``fit_mode="contain"`` is the modern spelling of the old
+        # ``allow_stretch=True, keep_ratio=True`` pair (which Kivy 2.3.1 emits a
+        # deprecation warning for): scale the QR up to fill the slot but never
+        # distort it — a stretched QR is a QR that does not decode. Nearest
         # filtering is not forced here because the texture is created by
         # KivyDisplay.
-        self.qr_image = Image(allow_stretch=True, keep_ratio=True, size_hint_x=0.7)
+        #
+        # ``fit_mode`` exists from Kivy 2.2 on, so it is safe on **both** targets
+        # this app ships to and no compatibility branch is needed:
+        #   * desktop — the installed Kivy is 2.3.1 (M12-T02);
+        #   * Android — p4a's kivy recipe pins ``version = '2.3.1'`` at the
+        #     revision this project builds against, and the recipe has pinned
+        #     >= 2.2.0 since p4a v2023.05.21 — far older than any revision that
+        #     supports the NDK r28c / Python 3.14 / api 33 combination this
+        #     project requires, so no reachable p4a pin can hand us Kivy < 2.2.
+        self.qr_image = Image(fit_mode="contain", size_hint_x=0.7)
         middle.add_widget(self.qr_image)
         # camera4kivy's Preview must live in the widget tree to run, so it gets a
         # narrow column; it doubles as the operator's aiming aid.
@@ -327,7 +345,7 @@ class PhotonTCPApp(App):
         # --- Buttons. ------------------------------------------------------ #
         buttons = BoxLayout(size_hint_y=None, height=52, spacing=6)
         self.start_button = Button(text="Start")
-        self.start_button.bind(on_release=self.on_start)  # type: ignore[attr-defined]
+        self.start_button.bind(on_release=self.on_start_pressed)  # type: ignore[attr-defined]
         self.stop_button = Button(text="Stop", disabled=True)
         self.stop_button.bind(on_release=self.on_stop)  # type: ignore[attr-defined]
         buttons.add_widget(self.start_button)
@@ -418,8 +436,22 @@ class PhotonTCPApp(App):
 
     # ------------------------------------------------------------ session --
 
-    def on_start(self, *_args) -> None:
-        """Start button handler: request permission, then launch the session."""
+    def on_start_pressed(self, *_args) -> None:
+        """Start button handler: request permission, then launch the session.
+
+        **The name matters.** This must NOT be called ``on_start``: Kivy's
+        :class:`~kivy.app.App` dispatches an ``on_start`` lifecycle event while
+        the app boots (``App.run`` → ``self.dispatch('on_start')``), so a method
+        with that name is invoked *by the framework* the moment the window
+        opens. Before M13 this class did define ``on_start``, and the effect was
+        that **the session started by itself** — camera permission was requested
+        and a handshake began without anyone pressing Start, which is both wrong
+        on its own and would corrupt the first on-device smoke observations.
+
+        :meth:`on_stop` is the deliberate exception (see its docstring): there
+        the framework's shutdown hook and the Stop button want the same thing.
+        Here they do not, so the names are kept apart.
+        """
         if self._running:
             return
         self.set_status("starting...")
@@ -453,7 +485,9 @@ class PhotonTCPApp(App):
         role, scale, hold, facing = self._read_settings()
 
         display = KivyDisplay(self.qr_image)
-        # A front lens previews mirrored, and a mirrored QR does not decode.
+        # A front lens previews mirrored. That is NOT a decoding problem — cv2
+        # reads mirrored QR fine (M13 measurement) — but normalising keeps the
+        # captured frame in the same orientation as the desktop path.
         camera = KivyCamera(flip_horizontal=(facing == "front"))
         preview, error = _make_preview(camera, facing)
         if preview is None:

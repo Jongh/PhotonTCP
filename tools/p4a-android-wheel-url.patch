@@ -1,0 +1,80 @@
+# python-for-android: 안드로이드 휠 URL 을 호스트 pip 으로 설치하려는 버그 우회
+#
+# 대상: python-for-android (kivy/python-for-android), v2026.05.09 기준 확인.
+#       버그를 들여온 커밋은 2f107b15 "Add support for prebuilt wheels (#3280)" (2026-03-28).
+#
+# ── 증상 ──────────────────────────────────────────────────────────────────────
+#   ERROR: charset_normalizer-3.5.1-cp314-cp314-android_24_arm64_v8a.whl
+#          is not a supported wheel on this platform.
+#   # Command failed: (... pythonforandroid.toolchain create ...)
+#
+# ── 원인 ──────────────────────────────────────────────────────────────────────
+# `process_python_modules()` 는 pip 을 **--platform=android_...** 로 돌려 의존성을
+# 해석하고, `is_wheel_compatible()` 이 참인 휠의 **URL 을 요구사항 목록에 넣는다**.
+# 그 판정은 안드로이드 전용 휠도 통과시키는데(변수 이름이 `pure_python` 이라 오해를
+# 부른다), 정작 설치는 `run_pymodules_install()` 에서 **그 platform 태그 없이** 호스트
+# pip 으로 실행된다. 해석과 설치가 서로 다른 플랫폼을 가정하므로, p4a 가 스스로 적어
+# 넣은 요구사항을 스스로 거부한다.
+#
+# ── 이 패치가 하는 일 ─────────────────────────────────────────────────────────
+# 설치 단계에 **해석 단계와 같은** platform 태그(+ hostpython 버전, `--only-binary`)를
+# 넘겨 두 단계의 가정을 일치시킨다. `--platform` 은 `--target` 을 요구하는데 그 호출은
+# 이미 `--target` 을 쓰므로 전제가 충족된다.
+#
+# ── 적용 (docs/mobile-build.md 5-4 참조) ──────────────────────────────────────
+#   cd .buildozer/android/platform/python-for-android
+#   git apply ../../../../tools/p4a-android-wheel-url.patch
+#   # 이미 적용돼 있는지 확인: git apply --check --reverse <이 파일>
+#
+# ── 실측 (M13-T01) ────────────────────────────────────────────────────────────
+# 적용 후 순수 파이썬 의존성 11 개가 정상 설치됐다:
+#   Successfully installed camera4kivy-0.3.3 certifi-2026.7.22 chardet-7.6.0
+#   charset-normalizer-3.5.1 filetype-1.2.0 gestures4kivy-0.1.4 idna-3.19
+#   requests-2.34.2 segno-1.6.6 six-1.17.0 urllib3-2.7.0
+#
+# ── 이 패치가 바꾸는 실패 양상 (대가) ────────────────────────────────────────
+# 설치 명령에 `--only-binary=:all:` 이 함께 들어간다(`--platform` 이 그것을 요구한다).
+# 그래서 **PyPI 에 휠이 없는 sdist-only 순수 파이썬 의존성**은 이제 소스 빌드로 넘어가지
+# 못하고 `No matching distribution` 으로 죽는다. M13 시점의 의존성 11 개는 전부 휠이
+# 있어 영향이 없지만, 의존성이 늘어 그런 패키지가 들어오면 **증상이 바뀐 것이지 우회가
+# 깨진 것이 아니다** — 그때는 그 패키지에 p4a 레시피를 주거나 휠이 있는 버전으로 핀한다.
+#
+# 또 `hostpython3` 버전 조회가 실패하면 `--python-version` 없이 돈다(그 조합은 미검증).
+#
+# 상류가 이 경로를 고치면 이 패치는 불필요해진다. 포크를 벤더링하지 않고 diff 한 장만
+# 두는 이유가 그것이다 — 무엇을 왜 바꿨는지가 이 파일 하나로 읽힌다.
+#
+diff --git a/pythonforandroid/build.py b/pythonforandroid/build.py
+index d88fdb1f..130cf51b 100644
+--- a/pythonforandroid/build.py
++++ b/pythonforandroid/build.py
+@@ -924,10 +924,27 @@ def run_pymodules_install(ctx, arch, modules, project_dir=None,
+                 "changes / workarounds."
+             )
+ 
++            # The resolver in process_python_modules() runs pip with the
++            # Android platform tags, so a dependency that publishes an Android
++            # wheel is recorded in requirements.txt as that wheel's URL. The
++            # install below must therefore assume the SAME platform, or pip
++            # rejects the very requirement p4a just wrote:
++            #   ERROR: <pkg>-cp3XX-android_..._arm64_v8a.whl is not a supported
++            #          wheel on this platform.
++            # --platform requires --target (already present) and --only-binary,
++            # which is also what the resolver assumed.
++            _tags = PyProjectRecipe.get_wheel_platform_tags(arch.arch, ctx)
++            _plat = " ".join("--platform={}".format(t) for t in _tags)
++            try:
++                _pyver = Recipe.get_recipe("hostpython3", ctx).version
++                _plat += " --python-version {}".format(_pyver)
++            except Exception:
++                pass
+             shprint(sh.bash, '-c', (
+                 "venv/bin/pip " +
+-                "install -v --target '{0}' --no-deps -r requirements.txt"
+-            ).format(ctx.get_site_packages_dir(arch).replace("'", "'\"'\"'")),
++                "install -v --target '{0}' --no-deps --only-binary=:all: " +
++                "{1} -r requirements.txt"
++            ).format(ctx.get_site_packages_dir(arch).replace("'", "'\"'\"'"), _plat),
+                     _env=copy.copy(env))
+ 
+         # Afterwards, run setup.py if present:
