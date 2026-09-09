@@ -58,7 +58,8 @@ tide 사이클은 단계로 나뉘며 각 단계에서 허용/금지되는 행�
 
 - 버전 단일 원본: **`pyproject.toml`** 의 `[project].version`.
 - release 단계의 버전 범프·CHANGELOG 갱신은 이 파일을 기준으로 한다.
-- 현재 버전: `0.10.0`.
+- 현재 버전 값은 **이 문서에 복제하지 않는다** — `pyproject.toml`을 직접 읽는다.
+  (복제하면 릴리즈마다 낡는다. `tests/test_docs_no_version_dup.py`가 재발을 문다.)
 
 ## 디렉터리
 

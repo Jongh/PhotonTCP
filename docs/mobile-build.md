@@ -14,6 +14,23 @@ PhotonTCP를 안드로이드 폰에 올려 **한 피어로** 돌리기 위한 �
 
 ## 0. 빌드 전 사전조건 — 확인 하나, 준비 하나
 
+**빌드를 시작하기 전에 아래 하니스를 먼저 돌려라.** 이 절과 1·2절의 사전조건을 한 번에
+점검해서 무엇이 준비됐고 무엇이 막혀 있는지를 표로 내놓는다(M12-T01).
+
+```bash
+python examples/mobile_build_preflight.py
+```
+
+- 인자는 없다. 하드웨어도 필요 없다. 각 항목에 `OK` / `WARN` / `BLOCK`과 사유 한 줄이 붙는다.
+- **종료 코드**: `BLOCK`이 하나라도 있으면 `1`, 없으면 `0`. `WARN`은 빌드를 막지 않는다.
+- 점검 항목: Docker 데몬 응답 · WSL2 일반 배포판 · `adb` · `buildozer` · 루트 `main.py` ·
+  `camerax_provider/` · `buildozer.spec` 필수 키 · `version.regex`로 버전 추출 · 디스크 여유 ·
+  `java` · `gradle`.
+- **도구가 없는 것과 도구가 있는데 실패하는 것을 다른 문구로 구분**한다(예: `docker` 미설치 vs
+  데몬 정지) — 대처가 다르기 때문이다. Docker 경로와 WSL2 경로는 **둘 중 하나만 성립하면**
+  통과이고, 둘 다 없을 때만 `BLOCK`이다.
+- `BLOCK`이 뜬 항목의 대처 명령은 출력 하단 `What to do` 절에 그대로 찍힌다.
+
 `buildozer.spec`만으로는 빌드가 되지 않는다. 아래 0-1은 **이미 저장소에 있으니 확인만**
 하면 되고, 0-2는 **빌드 직전에 직접 만들어야** 한다.
 
@@ -117,15 +134,36 @@ docker build --tag=kivy/buildozer .
 - `/home/user/hostcwd` — 프로젝트(= 이 저장소) 루트
 - `/home/user/.buildozer` — SDK/NDK 캐시. **이걸 마운트해야 다음 빌드가 빨라진다.**
 
-**Git Bash** (이 저장소의 권장 셸):
+> ⚠ **아래 명령은 M12-T05에서 실제로 돌려 고친 형태다.** 이전 판은
+> `--interactive --tty --rm` + `$HOME/.buildozer` **호스트 bind mount** 였는데, 그 구성이
+> 5-4절이 기록한 장애 넷(root 프롬프트 즉사 · NDK unzip 부분추출 · 호스트 메모리 압박으로
+> 컨테이너 사망 · `--rm`으로 로그 소실)을 **그대로 재현한다.** 처음 빌드하기 전에 **5-4절을
+> 먼저 읽어라** — 무엇이 왜 바뀌었는지가 거기 있다.
+
+**0) 캐시 volume 준비 (최초 1회)** — 호스트 경로 대신 named volume을 쓴다. Windows bind
+mount는 NDK의 수천 개 소파일 추출이 느리고 호스트 메모리를 압박한다.
+
+```bash
+docker volume create photontcp-buildozer
+```
+
+**1) 빌드 실행 — Git Bash** (이 저장소의 권장 셸):
 
 ```bash
 # MSYS_NO_PATHCONV=1 이 없으면 Git Bash가 /home/user/... 를 C:\... 로 바꿔버린다
-MSYS_NO_PATHCONV=1 docker run --interactive --tty --rm \
-    --volume "$HOME/.buildozer":/home/user/.buildozer \
+# --rm 을 쓰지 않는다: 컨테이너가 죽으면 진단에 필요한 로그까지 사라진다.
+MSYS_NO_PATHCONV=1 docker run -d --name photontcp-build --memory=6g \
+    --volume photontcp-buildozer:/home/user/.buildozer \
     --volume "$PWD":/home/user/hostcwd \
     kivy/buildozer android debug
+
+docker logs -f photontcp-build          # 진행 상황
+docker inspect -f '{{.State.Status}}|{{.State.ExitCode}}|{{.State.OOMKilled}}' photontcp-build
+docker rm -f photontcp-build            # 끝난 뒤 정리 (캐시 volume 은 남긴다)
 ```
+
+**2) NDK 사전 추출** — 첫 빌드가 `unzip -q ...ndk...zip` exit 1로 멈추면 5-4절 ②의
+`unzip -o` 절차를 한 번 돌린 뒤 위 명령을 다시 실행한다.
 
 **PowerShell**:
 
@@ -143,9 +181,9 @@ Windows 쪽 주의점:
   상대 경로(`.`)를 쓰지 않는다.
 - `$HOME/.buildozer`가 없으면 미리 만든다(`mkdir -p "$HOME/.buildozer"` /
   `New-Item -ItemType Directory -Force "$env:USERPROFILE\.buildozer"`).
-- 컨테이너는 비-root(`user`)로 돌므로, NTFS 볼륨에 쓰기 권한 문제가 생기면
-  `--user root`를 붙여 원인을 가른 뒤 다시 비-root로 돌린다(캐시 소유권이
-  root로 바뀌면 다음 빌드가 깨지므로 상시 사용은 피한다).
+- **컨테이너는 실제로 root로 돈다**(M12-T05 실측). 이 문서의 이전 판은 비-root(`user`)로
+  돈다고 적었으나 틀렸다 — 호스트 볼륨을 마운트해 돌리면 root다. 그래서 `warn_on_root = 0`이
+  스펙에 필요하다(5-4절 ①). `--user`를 손댈 이유는 없다.
 
 ### 1-4. 산출물
 
@@ -154,8 +192,8 @@ bin/photontcp-<version>-arm64-v8a-debug.apk
 ```
 
 `<version>`은 `buildozer.spec`이 `version.regex`로 `pyproject.toml`에서 읽어온 값이다
-(현재 `0.10.0`). 버전을 올리려면 `pyproject.toml`만 고치면 된다 — 스펙에 버전이
-두 번 선언돼 있지 않다.
+(값의 단일 출처는 그 파일이다 — 여기에 복제하지 않는다). 버전을 올리려면
+`pyproject.toml`만 고치면 된다 — 스펙에 버전이 두 번 선언돼 있지 않다.
 
 ---
 
@@ -416,6 +454,95 @@ opencv는 이 스펙에서 **가장 깨지기 쉬운 부분**이다. p4a는 open
 확인되면 그때 구현이 정당화된다"고 적었다. 즉 이 우회로 빌드가 성공했다는 사실
 자체가 다음 사이클에서 대체 백엔드를 구현할 근거가 된다. 백엔드를 꽂을 자리
 (`register_decoder_backend` / `set_decoder_backend`)는 M11-T01에서 이미 만들어졌다.
+
+### 5-4. M12-T05 실빌드 실측 — 실제로 걸린 것들
+
+M12-T05에서 이 문서의 Docker 경로를 **처음으로 끝까지 돌려 봤다.** 문서대로 해도 걸리는
+지점이 다섯 개 있었고, 넷은 닫았으며 하나가 **미해결로 남아 APK가 나오지 않았다.**
+
+| # | 증상 | 성격 | 조치 |
+|---|---|---|---|
+| 1 | 빌드 즉시 `EOFError` | 스펙 결함 | `buildozer.spec`에 `warn_on_root = 0` |
+| 2 | `unzip -q ...ndk...zip` exit 1 | 도구 동작 | NDK를 `unzip -o`로 사전 추출 |
+| 3 | 빌드 중 호스트 메모리 압박으로 컨테이너 사망 | 환경 | named volume + `--memory=6g` |
+| 4 | 컨테이너가 죽으면 로그가 사라짐 | 절차 | `--rm` 없이 detached 실행 |
+| 5 | `charset_normalizer-…-android_….whl is not a supported wheel` | **상류 버그(미해결)** | 아래 |
+
+**1 — root 프롬프트.** 이 이미지에 호스트 볼륨을 마운트해 돌리면 컨테이너가 **root로**
+실행되고, buildozer의 `warn_on_root = 1`이 `input()`으로 대화형 확인을 묻는다. TTY 없이
+돌리면 그 자리에서 `EOFError`로 죽는다. 스펙에서 `warn_on_root = 0`으로 닫았다.
+(그 값의 이전 주석이 *"Docker 이미지는 비-root 사용자로 돈다"* 라고 적고 있었는데 **틀렸다.**)
+
+**2 — NDK 압축 해제.** buildozer가 `unzip -q`(덮어쓰기 플래그 없음)로 NDK를 풀다가
+덮어쓰기 확인 프롬프트를 만나고, TTY가 없어 EOF → `[N]one`으로 처리돼 **부분 추출** 후
+exit 1. 사전에 `unzip -o`로 풀어 두면 buildozer가 그 디렉터리를 그대로 쓴다:
+
+```bash
+docker volume create photontcp-buildozer
+MSYS_NO_PATHCONV=1 docker run --rm \
+    --volume photontcp-buildozer:/home/user/.buildozer \
+    --entrypoint bash kivy/buildozer -c \
+    'cd /home/user/.buildozer/android/platform && unzip -o -q android-ndk-r28c-linux.zip'
+```
+
+**3·4 — 실행 방식.** `.buildozer` 캐시를 Windows 호스트 경로에 bind mount 하면 수천 개
+소파일 추출이 느리고 호스트 메모리를 압박한다. **named volume**으로 옮기고 컨테이너에
+메모리 상한을 준 뒤 안정됐다. 또 `--rm`으로 돌리면 죽는 순간 로그까지 사라지므로,
+진단이 목적일 때는 `--rm` 없이 detached로 돌리고 `docker logs`로 본다:
+
+```bash
+docker run -d --name photontcp-build --memory=6g \
+    --volume photontcp-buildozer:/home/user/.buildozer \
+    --volume "$PWD":/home/user/hostcwd \
+    kivy/buildozer android debug
+docker logs -f photontcp-build
+```
+
+> 3의 2차 피해로 **venv의 pip이 깨질 수 있다.** 컨테이너가 `pip install -U pip` 도중
+> 죽으면 `.buildozer/.../build/venv`에 두 버전의 pip 파일이 섞여
+> `ImportError: cannot import name 'BuildDependencyInstallError'`가 난다. 그 venv를
+> 지우고 다시 돌리면 해소된다(`site-packages`에 `pip-*.dist-info`가 둘이면 이 상태다).
+
+**5 — 미해결: p4a의 안드로이드 휠 URL (APK 미산출의 직접 원인).**
+
+p4a는 레시피 없는 순수 파이썬 요구사항의 의존성을 해석할 때, PyPI에 **안드로이드 전용
+휠**이 있으면 그 휠의 URL을 요구사항 목록에 집어넣는다. 그러나 설치는
+`--platform`/`--only-binary` 없이 **호스트 pip**으로 실행하므로
+(`pythonforandroid/build.py:927`) 자기가 넣은 요구사항을 스스로 거부한다:
+
+```
+[INFO]: The requirements (camera4kivy, certifi, chardet, filetype, gestures4kivy,
+        idna, requests, segno, six, urllib3,
+        https://files.pythonhosted.org/.../charset_normalizer-3.5.1-cp314-cp314-android_24_arm64_v8a.whl)
+        don't have recipes, attempting to install them with pip
+-> running venv/bin/pip install -v --target '.../python-installs/photontcp/arm64-v8a' \
+       --no-deps -r requirements.txt
+ERROR: charset_normalizer-3.5.1-cp314-cp314-android_24_arm64_v8a.whl
+       is not a supported wheel on this platform.
+```
+
+걸리는 경로는 **camera4kivy → requests → charset-normalizer**이고, 그 의존성 묶음에서
+컴파일 확장을 가진 것이 charset-normalizer 하나뿐이라 그것만 터진다.
+
+**시도했고 듣지 않은 우회 둘**(둘 다 실측):
+
+- `requirements`에 `charset-normalizer==3.3.2` 핀 → p4a가 핀과 **무관하게** 3.5.1 휠
+  URL을 따로 덧붙인다(요구사항 목록에 둘 다 등장).
+- `p4a.extra_args = --skip-prebuilt` → 인자는 전달됐지만(p4a 명령줄에서 확인) 효과 없음.
+  그 옵션은 `Recipe.check_prebuilt()`만 끄므로 **레시피**의 프리빌트 휠에만 관여한다.
+
+**남은 경로**(다음 사이클): 상류 수정(p4a의 pip 호출에 `--platform`/`--only-binary` 추가),
+`p4a.fork`/`p4a.branch`로 그 경로가 없는 리비전 고정, 또는 `p4a.source_dir`로 패치한
+p4a 체크아웃 지정. 어느 쪽이든 **우리 코드의 문제가 아니다** — opencv를 포함한 모든
+네이티브 레시피는 이 지점 **전에** 이미 성공적으로 컴파일된다(아래).
+
+**여기까지는 성공했다(실측):** SDK cmdline-tools 6514223 · NDK r28c · buildozer
+1.6.1.dev0 · 레시피 hostpython3 · libffi · openssl · sqlite3 · python3 · sdl2(+image·
+mixer·ttf) · **numpy** · setuptools · pyjnius · android · **opencv** · kivy 전부 빌드 완료.
+특히 **opencv는 100% 컴파일됐다** — `libopencv_gapi.so` 링크와 `opencv_python3` 타깃
+(`cv2.cpp`·`cv2_numpy.cpp` 등) 빌드가 로그에 남아 있다. 즉 M11이 최대 불확실성으로
+지목했던 **p4a 이슈 #3203(opencv × numpy 2.x)은 이 조합에서 발현하지 않았다.**
+실패는 네이티브 컴파일이 아니라 그 뒤의 **순수 파이썬 의존성 설치 단계**에서 났다.
 
 ---
 

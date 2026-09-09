@@ -15,7 +15,8 @@ from .devices import (
     MemoryDisplay,
     memory_device_pair,
 )
-from .peer import PeerResult, run_peer
+# NOTE: ``.peer`` is deliberately NOT imported here — see the lazy re-export at
+# the bottom of this module.
 
 # The device abstractions, the in-memory fakes, and OpticalChannel are all
 # hardware-free (channel.py imports only numpy / the QR codec / devices, never
@@ -45,3 +46,37 @@ except ImportError:  # pragma: no cover - exercised only on cv2-absent machines
     Cv2Camera = None  # type: ignore[assignment]
 else:
     __all__ += ["Cv2Display", "Cv2Camera"]
+
+
+# ---------------------------------------------------------------------------
+# Lazy re-export of the session driver (M12-T03, PEP 562)
+# ---------------------------------------------------------------------------
+# ``peer.py`` imports ``photontcp.app`` and ``photontcp.session`` — the *upper*
+# layers. Importing it from this ``__init__`` made ``import photontcp.optical``
+# (a transport-layer package) drag the whole session/app stack in, which is the
+# reverse of the dependency direction README states ("upper layers depend only
+# on ``Channel``"). M11-review flagged that as minor 11.
+#
+# ``run_peer`` / ``PeerResult`` stay part of this package's public surface —
+# ``__all__`` above is unchanged and ``from photontcp.optical import run_peer``
+# still works (``examples/optical_link.py`` relies on it) — but the submodule is
+# now imported on FIRST ATTRIBUTE ACCESS instead of at package import time.
+# The resolved objects are cached into module globals, so the ``__getattr__``
+# hook runs at most once per name.
+_LAZY_PEER_EXPORTS = ("run_peer", "PeerResult")
+
+
+def __getattr__(name: str):
+    """PEP 562 hook: resolve ``run_peer`` / ``PeerResult`` on demand."""
+    if name in _LAZY_PEER_EXPORTS:
+        from .peer import PeerResult, run_peer  # noqa: PLC0415 - intentional
+
+        globals()["run_peer"] = run_peer
+        globals()["PeerResult"] = PeerResult
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    """Keep the lazy names visible to ``dir()`` / tab completion."""
+    return sorted(set(globals()) | set(_LAZY_PEER_EXPORTS))

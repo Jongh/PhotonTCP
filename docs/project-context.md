@@ -7,9 +7,11 @@
 ## 스택 · 언어 · 의존성
 
 - 언어: **Python** (`requires-python >= 3.10`), 패키지명 `photontcp`.
-- 버전 단일 원본: `pyproject.toml` 의 `[project].version` — 현재 `0.10.0`.
+- 버전 단일 원본: `pyproject.toml` 의 `[project].version` — **값은 그 파일에서 읽는다**
+  (문서에 복제하지 않는다).
 - **런타임 필수 의존성 없음**(`dependencies = []`). 기능별 optional extras로 분리:
-  - `qr` = segno, qrcode / `optical` = opencv-python, pyzbar / `app` = msgpack / `dev` = pytest
+  - `qr` = segno, qrcode / `optical` = opencv-python, pyzbar / `app` = msgpack /
+    `mobile` = kivy, camera4kivy, gestures4kivy / `dev` = pytest
 - 빌드 백엔드: setuptools (`>=61`).
 
 ## 최상위 디렉터리
@@ -17,23 +19,26 @@
 | 경로 | 역할 |
 |---|---|
 | `photontcp/` | 라이브러리 본체 (아래 계층 표) |
-| `tests/` | pytest 스위트 (21개 파일 — 계층별 + 광학/QR 견고성) |
+| `tests/` | pytest 스위트 (계층별 + 광학/QR 견고성 + 모바일. 파일·테스트 수는 사이클마다 변하므로 여기 박지 않는다 — `python -m pytest -q` 출력이 단일 출처다) |
 | `examples/` | 실행 가능한 데모·하니스 (`*_loopback.py`, `optical_link.py`, `optical_selfcheck.py`, `qr_decode_bench.py`) |
 | `docs/` | tide 산출물 — `milestones/`, `reports/`, `conventions.md`, 이 문서, `v1.0-signoff.md` |
 | `.tide/` | 사이클 상태·선호도 파일 (`docs/conventions.md`의 "상태 파일 규약") |
+| `main.py` | Android(python-for-android) 파이썬 진입 파일 — p4a가 `source.dir` 루트에서 이 이름으로 **고정** 탐색한다. `photontcp.mobile.app.main()`을 부르기만 한다 |
+| `buildozer.spec` | APK 패키징 스펙(버전은 `version.regex`로 `pyproject.toml`에서 읽는다). 절차·우회는 `docs/mobile-build.md` |
 
 ### `photontcp/` 계층 (아래에서 위로)
 
 | 패키지 | 역할 |
 |---|---|
 | `channel/` | 채널 추상 `Channel` + `LoopbackChannel`·`ImageLoopbackChannel`(가상) |
-| `optical/` | 실물 광학 채널 `OpticalChannel` + `DisplaySink`/`CameraSource` 추상 + `Cv2Display`/`Cv2Camera` |
+| `optical/` | 실물 광학 채널 `OpticalChannel` + `DisplaySink`/`CameraSource` 추상 + `Cv2Display`/`Cv2Camera` + 하드웨어 없는 피어 드라이버 `run_peer`/`PeerResult`(`peer.py` — 핸드셰이크→채팅→종료를 한 자리에서 몰고 `on_event`로 진행을 알린다) |
 | `qr/` | bytes ↔ QR 프레임 인코드/디코드 (`decode_frame`은 전처리 캐스케이드 + 대체 detector 폴백) |
 | `packet/` | 헤더 직렬화 · 패킷 타입 · CRC32 |
 | `reliability/` | 슬라이딩 윈도우 ARQ · 재전송 · RTO 추정 · 직렬화 |
 | `session/` | SYN/SYN_ACK/ACK 핸드셰이크 · FIN 종료 · 하트비트 · 상태머신 · 클록 |
 | `stream/` | stream_id 다중화 (0 = 제어 스트림) |
 | `app/` | Chat 앱 · File 앱 + 각 코덱 |
+| `mobile/` | Kivy/Android 어댑터 — `KivyDisplay`(QR을 Kivy `Texture`로 올려 위젯에 붙이는 `DisplaySink`) · `KivyCamera`(camera4kivy `Preview` 콜백이 먹이는 `CameraSource`, 최신 1프레임만 보관) + 앱 골격 `PhotonTCPApp`/`main`(위젯 트리 + 채널 조립 + 워커 스레드에서 `run_peer` 구동, 프로토콜 로직 없음). Kivy 부재 시 재수출이 `None`으로 가드돼 `import photontcp.mobile`은 깨지지 않는다 |
 
 **설계 불변**: 세션·신뢰성·앱 계층은 `Channel` 인터페이스에만 의존한다. 채널 구현(루프백 ↔ 실물
 광학)을 갈아 끼워도 상위 계층은 바뀌지 않는다.
@@ -45,6 +50,9 @@
 - 실물 검증(수동, 하드웨어 필요): `python examples/optical_selfcheck.py --camera 0 --hold 0.3 --count 20`,
   `python examples/optical_link.py --real --role sender|receiver` — 절차와 합격 기준은 `README.md`의
   "실물 검증 절차" 및 `docs/v1.0-signoff.md`.
+- 모바일 앱(데스크톱에서도 뜬다, Kivy 필요): `python -m photontcp.mobile.app`
+  (`pip install -e .[mobile]`). Android에서는 레포 루트 `main.py`가 같은 `main()`을 부른다 —
+  APK 빌드 절차·툴체인·실패 시 우회는 `docs/mobile-build.md`.
 - 설치형 CLI 진입점(`[project.scripts]`)은 없다 — 예제 스크립트를 직접 실행한다.
 
 ## 핵심 도메인 개념

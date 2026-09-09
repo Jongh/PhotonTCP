@@ -131,11 +131,16 @@ android.minapi = 24
 android.ndk_api = 24
 
 # (str) NDK 버전.
-# **확인 필요**: 여기서 고정하지 않고 buildozer가 자기 버전에 맞춰 내려받는 기본
-# NDK를 그대로 쓴다. 이유 — 잘못된 NDK를 자신 있게 박아 두는 것이 아무것도 안 적는
-# 것보다 나쁘다. 최신 default.spec의 주석 기본값은 `28c`지만, 그 값이 opencv/numpy
-# 레시피 및 api=33 조합에서 실제로 통과하는지는 T06의 실빌드로만 확인된다.
-# T06에서 NDK 버전 불일치 오류가 나면 그때 buildozer가 보고하는 값으로 아래를 켠다.
+# **r28c로 확인됨 (M12-T05 실빌드 실측).** buildozer 1.6.1.dev0이 자기 버전에 맞춰
+# `r28c`를 내려받았고(`Recommended android's NDK version by p4a is: 28c`), 그 NDK로
+# **opencv를 포함한 모든 네이티브 레시피가 컴파일에 성공**했다 — numpy·python3·sdl2·
+# pyjnius·opencv 전부. 즉 M11이 우려한 opencv×numpy 조합(p4a 이슈 #3203)은 이 NDK에서
+# 발현하지 않는다. 그 빌드가 APK까지 가지 못한 것은 NDK와 무관한 별개 지점이다
+# (`docs/mobile-build.md` 5-4의 상류 버그).
+#
+# 그래도 **값을 박지 않고 주석 처리로 남긴다**: buildozer가 내려받는 기본값이 이미
+# r28c이므로 박아도 동작이 같고, 박아 두면 buildozer를 올렸을 때 새 기본값과 어긋나
+# 되레 낡는다. 아래 줄은 "무엇이 실제로 통과했는지"의 기록이지 필요한 설정이 아니다.
 #android.ndk = 28c
 
 # (list) 빌드 대상 아키텍처.
@@ -175,11 +180,52 @@ p4a.hook = camerax_provider/gradle_options.py
 # `docs/mobile-build.md`의 실패 대처 절에 적었다.
 #p4a.branch = master
 
+# (str) p4a 에 그대로 넘기는 추가 인자. **현재 비워 둔다.**
+#
+# M12-T05 에서 `--skip-prebuilt` 를 시도했으나 **효과가 없었다**(실측). 그 옵션은
+# `Recipe.check_prebuilt()` 만 끄므로 *레시피*의 프리빌트 휠에만 관여하고, 아래에 적은
+# 의존성 해석 경로가 만들어 내는 안드로이드 휠 URL 은 그대로 남는다. 인자가 실제로
+# 전달된 것은 로그의 p4a 명령줄에서 확인했다 — 즉 "안 먹힌" 것이지 "안 넘어간" 것이
+# 아니다. 되지 않는 우회를 켜 둔 채로 남기지 않기 위해 지운다.
+#
+# ── 미해결 상류 버그 (M12-T05, APK 미산출의 직접 원인) ──
+#
+# p4a 는 레시피 없는 순수 파이썬 요구사항의 의존성을 해석할 때, PyPI 에 **안드로이드
+# 전용 휠**이 있으면 그 휠의 URL 을 요구사항 목록에 집어넣는다. 그런데 설치는
+# `--platform`/`--only-binary` 없이 호스트 pip 으로 실행한다
+# (`pythonforandroid/build.py:927` — `venv/bin/pip install -v --target ... -r requirements.txt`).
+# 그래서 자기가 넣은 요구사항을 스스로 거부한다:
+#
+#     ERROR: charset_normalizer-3.5.1-cp314-cp314-android_24_arm64_v8a.whl
+#            is not a supported wheel on this platform.
+#
+# 이 프로젝트가 걸리는 경로: camera4kivy -> requests -> charset-normalizer.
+# 그 묶음에서 컴파일 확장을 가진 것이 charset-normalizer 하나뿐이라 그것만 터진다
+# (certifi·idna·urllib3·six·filetype·chardet 은 순수 파이썬).
+#
+# 시도했고 듣지 않은 것 둘: `requirements` 에 `charset-normalizer==3.3.2` 핀
+# (p4a 가 핀과 무관하게 3.5.1 휠 URL 을 따로 덧붙인다), `--skip-prebuilt`(위).
+# 남은 경로는 상류 수정 또는 p4a 포크 고정이며 다음 사이클 항목이다.
+# 상세는 `docs/mobile-build.md` 5-4 절.
+#p4a.extra_args =
+
 [buildozer]
 
 # (int) 로그 수준 (0 = error only, 1 = info, 2 = debug (with command output))
 # 첫 빌드는 실패 분석이 핵심이므로 2로 둔다.
 log_level = 2
 
-# (int) root로 실행 시 경고. Docker 이미지는 비-root 사용자로 도므로 그대로 둔다.
-warn_on_root = 1
+# (int) root로 실행 시 경고할지. **0으로 둔다 (M12-T05 실측으로 확정).**
+#
+# 주석에 "Docker 이미지는 비-root 사용자로 도므로 그대로 둔다"고 적혀 있었으나 **틀렸다** —
+# `kivy/buildozer` 이미지에 호스트 볼륨을 마운트해 돌리면 실제로 root로 실행되고, 그때
+# `warn_on_root = 1`은 `input('Are you sure you want to continue [y/n]? ')`로 **대화형 확인을
+# 묻는다**. TTY 없이(비대화형·CI·백그라운드) 돌리면 그 자리에서 `EOFError`로 죽는다:
+#
+#     File ".../buildozer/__init__.py", line 702, in check_root
+#       cont = input('Are you sure you want to continue [y/n]? ')
+#     EOFError: EOF when reading a line
+#
+# 문서화된 Docker 경로가 문서 그대로 돌지 않는다는 뜻이라 스펙에서 닫는다. root 실행 자체는
+# 컨테이너 안에서 일어나므로 호스트에 미치는 영향이 없다.
+warn_on_root = 0

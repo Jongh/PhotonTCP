@@ -5,6 +5,34 @@
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-09
+
+v1.0 사인오프를 목표로 한 사이클. **APK 실빌드를 처음으로 끝까지 돌렸고, 실패 원인을 상류 버그 한 지점으로 특정**했다. 하드웨어·툴체인이 필요 없는 작업 넷은 전부 완료됐다. 사인오프 실측(체크 A·체크 B)은 APK가 나오지 않아 수행하지 못했으므로 **v1.0은 이번에도 주장하지 않는다**.
+
+### Added
+
+- **빌드 사전조건 하니스** `examples/mobile_build_preflight.py`: Docker 데몬·WSL2 배포판·`adb`·`buildozer`·루트 `main.py`·`camerax_provider/`·`buildozer.spec` 필수 키·`version.regex` 추출·디스크 여유·`java`·`gradle` 11개 항목에 `OK`/`WARN`/`BLOCK`을 낸다. **「도구가 없다」와 「도구가 있는데 실패한다」를 다른 문구로 구분**하고(대처가 다르므로), 한 점검이 예외로 죽어도 나머지가 계속 돈다. 종료 코드는 BLOCK 유무를 따른다.
+- **`reset_decoder_backend_probe()`** (공개 API): 모듈이 캐시하는 환경 probe(cv2 부재 여부, 대체 detector 종류)를 무효화한다. `register_decoder_backend()`·`set_decoder_backend()`가 자동으로 호출한다.
+- **`app.py` 상태 전이 테스트** 45건 — `format_summary()`·`_read_settings()`·`on_event()`·`_make_preview()`. Kivy 미설치 환경에서는 최소 스텁을 심어 **실제 모듈**을 로드해 검증하고, 설치 환경에서는 실물로 돈다(양쪽 모두 통과 실측).
+- **문서 버전 복제 재발 가드** `tests/test_docs_no_version_dup.py` 15건, **레이어 경계 가드** `tests/test_optical_import.py` 8건(새 프로세스 격리).
+
+### Changed
+
+- **cv2 부재 probe 비용 제거**: 실패한 `import cv2`는 `sys.modules`에 캐시되지 않아 프레임마다 `sys.path`를 전수 탐색했다. 이제 **부재만** 캐시한다 — 그 방향으로는 낙관적 stale(cv2가 사라졌는데 `"cv2"`로 보고)이 구조적으로 불가능하고, 보수적 방향만 남으며 그것은 위 무효화 지점이 받는다. opencv 없는 안드로이드 빌드가 문서가 권하는 경로이므로 그 비용이 정확히 거기 얹혔다.
+- **`photontcp.optical`이 상위 계층을 더는 끌어오지 않는다**: `run_peer`/`PeerResult`를 PEP 562 모듈 `__getattr__`로 **지연 재수출**한다. `import photontcp.optical`이 `photontcp.app`·`photontcp.session`을 로드하던 것이 사라졌다(전송 계층이 응용 계층에 의존하던 역방향 자리). `__all__`·`from … import run_peer`는 불변이다.
+- **문서의 버전 복제 제거**: `docs/conventions.md`·`docs/project-context.md`·`docs/mobile-build.md` 세 곳이 버전 값을 복제해 릴리즈마다 낡았다. 값을 지우고 선언처(`pyproject.toml`)를 가리키게 했다 — 갱신 단계를 늘리는 것이 아니라 복제를 없애는 방향이다.
+- **`buildozer.spec` 실측 반영**: `warn_on_root = 0`(컨테이너가 root로 돌아 대화형 확인에서 죽는 것을 막는다 — 이전 주석의 *"비-root로 돈다"* 는 서술이 실측으로 반증됐다), `android.ndk` 주석을 **r28c 확인됨**으로 갱신.
+- **`docs/mobile-build.md` Docker 절차를 실제로 돌아가는 형태로 교체**: named volume · `-d --memory` · `--rm` 제거. 이전 명령은 이번에 닫은 장애 넷을 그대로 재현하는 구성이었다.
+
+### Notes
+
+- 전체 스위트 **319 passed / 1 skipped**(환경에 Kivy가 설치되면 2). v0.11.0 기준선 247 → **+72 신규**, 회귀 0. 벤치: clean 249/249 = 100%, degraded 249/249 = 100%.
+- **APK 빌드 실측** — 문서화된 Docker 경로가 비대화형에서 깨지는 지점 **다섯**을 만나 **넷을 닫았다**: ① root 프롬프트로 인한 즉시 종료 ② NDK 압축 해제의 덮어쓰기 프롬프트 ③ 호스트 캐시 마운트로 인한 메모리 압박 ④ 컨테이너 사망 시 로그 소실. 재현 절차는 `docs/mobile-build.md` 5-4절.
+- **미해결 하나가 APK를 막는다**: p4a가 의존성 해석에서 안드로이드 전용 휠의 URL을 요구사항에 넣고, 정작 `--platform` 없이 **호스트 pip**으로 설치해 자기가 넣은 요구사항을 거부한다. 걸리는 경로는 camera4kivy → requests → charset-normalizer. 우회 둘(버전 핀, `--skip-prebuilt`)을 시도했고 **둘 다 듣지 않아 되돌렸다**.
+- **opencv는 통과했다**: `libopencv_gapi.so` 링크와 `opencv_python3` 타깃이 빌드됐다. v0.11.0이 *"이 이식의 최대 불확실성"* 으로 적었던 opencv × numpy 조합은 이 NDK(r28c)에서 발현하지 않았다. **실패는 네이티브 컴파일이 아니라 그 뒤의 순수 파이썬 의존성 설치 단계**다.
+- **데스크톱 선검증으로 앞당겨 확정된 것 둘**: `colorfmt="luminance"` 텍스처가 데스크톱 GL 백엔드에서 수용되고, `connect_camera(enable_analyze_pixels=…, camera_id=…)` 키워드가 camera4kivy 0.3.3에서 그대로 받아들여진다. **안드로이드 GLES와 실제 픽셀 콜백은 여전히 미검증**(개발 머신에 웹캠 없음).
+- **v1.0 잔여**: ① 위 상류 버그 우회 ② APK 산출 + 폰 기동 스모크 ③ 체크 A(수신율 ≥ 80%)·체크 B(폰+PC 왕복) 실측. 5사이클 연속 이월이지만 성격이 바뀌었다 — 이전 넷은 *"두 번째 기기가 없어서"* 였고 이번엔 **기기는 있는데 빌드가 막혀서**다. 상태는 `docs/v1.0-signoff.md` 3절.
+
 ## [0.11.0] - 2026-09-09
 
 모바일(Android) 1급 지원. 안드로이드 폰이 자기 화면으로 QR을 띄우고 자기 카메라로 상대 QR을 잡아 **한 피어로 동작**할 수 있는 상태가 됨 — v1.0 사인오프의 체크 B(2-머신 왕복)에 두 번째 PC가 없어도 되는 경로가 열림. 세션·신뢰성·앱 계층은 한 줄도 바뀌지 않음(`Channel` 인터페이스만 의존). 공개 계약(`decode_frame` 시그니처·None 계약, CLI 인자 집합·종료 코드) 불변.

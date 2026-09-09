@@ -128,7 +128,8 @@ M11에서 **안드로이드 폰이 한 피어로 동작**할 수 있게 되었�
   코드**를 씁니다. 진행 상황은 `on_event(kind, detail)` 콜백으로만 흘러 라이브러리가 print하지
   않습니다.
 - **디코더 백엔드 seam**: `qr/decode.py`가 cv2를 **지연 import**하고, 디코더를 이름으로 등록·선택할
-  수 있습니다(`register_decoder_backend` / `set_decoder_backend` / `active_decoder_backend`).
+  수 있습니다(`register_decoder_backend` / `set_decoder_backend` / `active_decoder_backend`
+  / `reset_decoder_backend_probe`).
   cv2가 없는 플랫폼에서도 패키지가 import되고 `decode_frame`은 예외 대신 `None`을 돌려줍니다
   (None 계약·never-raise 불변). 이는 p4a의 무거운 opencv 레시피가 실패할 때를 위한 위험 분산입니다.
 - 개발 설치: `pip install photontcp[mobile]` (Kivy·camera4kivy).
@@ -136,6 +137,25 @@ M11에서 **안드로이드 폰이 한 피어로 동작**할 수 있게 되었�
 **빌드 방법**: [`docs/mobile-build.md`](docs/mobile-build.md) — Docker 경로와 WSL2 경로를 각각
 명령 단위로, `adb install` 절차와 실패 시 로그 위치까지 적어 두었습니다. 설정의 단일 원본은
 [`buildozer.spec`](buildozer.spec)입니다.
+
+#### 데스크톱 선검증 (M12 실측)
+
+실기가 없어도 확인할 수 있는 것은 데스크톱 Kivy에서 먼저 봤습니다 — 폰에서 처음 만나면
+빌드·기기·코드 중 어디가 원인인지 분리하기 어렵기 때문입니다. Windows 11 / Python 3.12 /
+Kivy 2.3.1 / SDL2 윈도 프로바이더 / GLEW·OpenGL 4.6 (NVIDIA GTX 1660 Ti) 기준:
+
+- `python -m photontcp.mobile.app`이 **뜨고 위젯 트리가 그려집니다** — 설정 행(role·scale·hold·
+  facing) · QR 영역 + 프리뷰 슬롯 · 상태 줄 · Start/Stop 두 버튼.
+- **`colorfmt="luminance"` 텍스처가 데스크톱 GL 백엔드에서 수용됩니다.** `Texture.create` +
+  `blit_buffer` + `flip_vertical`이 모두 통과하고, `KivyDisplay.show()`도 실제 텍스처를
+  `Image` 위젯에 올립니다. 안드로이드 GLES는 별개이므로 여전히 미검증입니다.
+- **camera4kivy 부재는 크래시가 아니라 상태 줄 한 줄로 끝납니다** — Start를 누르면
+  `camera4kivy not installed (…) - cannot capture frames. Session not started.`가 뜨고 앱은
+  계속 살아 있습니다.
+- `Preview.connect_camera(enable_analyze_pixels=True, camera_id="back")` 키워드 이름이
+  camera4kivy 0.3.3에서 **그대로 받아들여집니다**(`TypeError` 없음). 다만 이 머신에 웹캠이 없어
+  (`VIDEOIO(DSHOW): backend … can't be used to capture by index`) 픽셀 콜백은 한 번도 불리지
+  않았고, 따라서 **콜백 시그니처·RGBA 행 순서·분석 버퍼 재사용 여부는 여전히 미측정**입니다.
 
 #### 현재 한계 (정직하게)
 
@@ -148,8 +168,9 @@ M11에서 **안드로이드 폰이 한 피어로 동작**할 수 있게 되었�
   제출 시점에 버퍼를 복사합니다(`copy_on_submit=True` — 콜백 스레드의 memcpy 한 장).
 - 그래서 `KivyCamera(flip_vertical=…, flip_horizontal=…)`와 `KivyDisplay(colorfmt=…,
   flip_vertical=…)`의 기본값은 **실기 확인이 필요**합니다. QR은 상하/좌우가 뒤집히면 디코드되지
-  않으므로, 첫 실기 실행에서 디코드가 0이면 이 플래그부터 뒤집어 보십시오. 안드로이드 GLES
-  백엔드가 `luminance` 텍스처를 받는지도 미검증이며, 거부되면 `colorfmt="rgb"`로 바꿉니다.
+  않으므로, 첫 실기 실행에서 디코드가 0이면 이 플래그부터 뒤집어 보십시오. `luminance` 텍스처는
+  데스크톱 GL에서는 수용됨이 확인됐지만(위 「데스크톱 선검증」) **안드로이드 GLES 백엔드는 여전히
+  미검증**이며, 거부되면 `colorfmt="rgb"`로 바꿉니다.
 - APK에 opencv를 넣을지는 `buildozer.spec`에 사유와 함께 명시돼 있습니다. 레시피가 실패해
   opencv를 빼면 앱은 뜨지만 **QR을 한 장도 디코드하지 못해** 광학 링크가 성립하지 않습니다
   (우회 절차와 그 의미는 `docs/mobile-build.md` 5-3 참조). 대체 디코더 백엔드(ZXing 등)의 실제

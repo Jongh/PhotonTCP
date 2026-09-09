@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import sys
 
 import pytest
@@ -32,6 +33,7 @@ from photontcp.qr.decode import (  # noqa: E402
     active_decoder_backend,
     decode_frame,
     register_decoder_backend,
+    reset_decoder_backend_probe,
     set_decoder_backend,
 )
 from photontcp.qr.encode import encode_frame  # noqa: E402
@@ -65,26 +67,41 @@ def _restore_backend_registry():
 
 
 class _BlockCv2:
-    """``import cv2`` 를 ImportError 로 만드는 ``sys.meta_path`` finder."""
+    """``import cv2`` 를 ImportError 로 만드는 ``sys.meta_path`` finder.
+
+    ``lookups`` 는 finder 가 실제로 조회된 횟수다 — M12-T03 이 넣은 **실패 import
+    음성 캐시**가 정말 매 프레임의 ``sys.path`` 전수 탐색을 걷어냈는지 세는 데 쓴다.
+    """
+
+    def __init__(self) -> None:
+        self.lookups = 0
 
     def find_spec(self, fullname, path=None, target=None):  # noqa: D102
         if fullname == "cv2" or fullname.startswith("cv2."):
+            self.lookups += 1
             raise ImportError("cv2 blocked by test (simulated absence)")
         return None
 
 
-@pytest.fixture
-def no_cv2():
+@contextlib.contextmanager
+def blocked_cv2(*, reset_on_exit: bool = True):
     """cv2 부재를 시뮬레이션한다 (모듈 캐시 + import 경로 양쪽).
 
-    ``_require_cv2`` 는 매 호출마다 ``import cv2`` 를 시도하므로, 캐시된
-    모듈을 치우고 import 자체를 막아야 실제 부재와 같아진다. 종료 시
-    ``sys.meta_path`` 와 ``sys.modules`` 를 정확히 원복한다 — 이 모듈이
+    ``_require_cv2`` 가 cv2 를 못 찾도록 캐시된 모듈을 치우고 import 자체를 막는다.
+    종료 시 ``sys.meta_path`` 와 ``sys.modules`` 를 정확히 원복한다 — 이 모듈이
     다른 테스트의 cv2 를 망가뜨리면 안 된다.
+
+    **``reset_on_exit``**: M12-T03 이 실패한 cv2 import 를 캐시하므로, 차단을
+    풀었다는 사실을 모듈에 알려야 가용성이 즉시 회복된다. 기본값 ``True`` 가
+    :func:`reset_decoder_backend_probe` 를 불러 그 일을 한다(= 마일스톤이 지정한
+    "기존 테스트 fixture 에서 무효화 함수를 부른다"). ``False`` 로 두면 무효화가
+    **일어나지 않은** 상태를 관찰할 수 있어, 무효화 지점 자체를 테스트할 수 있다.
 
     ``_alt_kind`` 캐시는 이 경로에서 건드려지지 않는다: cv2 백엔드 factory 가
     먼저 "unavailable" 을 반환해 ``decode_frame`` 이 백엔드에 진입조차 하지
     않기 때문이다. 그래도 안전하게 값을 스냅샷/복원한다.
+
+    ``yield`` 값은 blocker 객체라 ``lookups`` 로 import 시도 횟수를 볼 수 있다.
     """
     saved_modules = {
         name: mod
@@ -96,8 +113,10 @@ def no_cv2():
     blocker = _BlockCv2()
     sys.meta_path.insert(0, blocker)
     saved_alt_kind = _decode_mod._alt_kind
+    # 차단을 시작하는 것도 환경 변화다 — 이전에 캐시된 판정을 들고 들어가지 않는다.
+    reset_decoder_backend_probe()
     try:
-        yield
+        yield blocker
     finally:
         try:
             sys.meta_path.remove(blocker)
@@ -105,6 +124,16 @@ def no_cv2():
             pass
         sys.modules.update(saved_modules)
         _decode_mod._alt_kind = saved_alt_kind
+        if reset_on_exit:
+            reset_decoder_backend_probe()
+            _decode_mod._alt_kind = saved_alt_kind
+
+
+@pytest.fixture
+def no_cv2():
+    """:func:`blocked_cv2` 의 fixture 판(기존 테스트들이 쓰는 이름)."""
+    with blocked_cv2() as blocker:
+        yield blocker
 
 
 @pytest.fixture
@@ -347,4 +376,97 @@ def test_automatic_selection_prefers_registration_order() -> None:
     assert active_decoder_backend() == "cv2"
 
     payload = b"still cv2"
+    assert decode_frame(encode_frame(payload)) == payload
+
+
+# --------------------------------------------------------------------------- #
+# 3. cv2 부재 probe 비용의 음성 캐시 (M12-T03, 완료 기준 4)
+# --------------------------------------------------------------------------- #
+#
+# M11-T01 은 가용성을 **일부러** 캐시하지 않았다 — ``active_decoder_backend()`` 가
+# stale ``"cv2"`` 를 보고하지 않게 하기 위함이다. M12-T03 은 그 성질을 유지한 채
+# **실패(부재)만** 캐시한다: 실패한 import 는 ``sys.modules`` 에 남지 않아 매
+# ``decode_frame`` 호출이 ``sys.path``/``sys.meta_path`` 를 전수 탐색하는데, 그 상태가
+# 바로 ``docs/mobile-build.md`` 5-3 우회 경로의 상시 조건이기 때문이다.
+#
+# 아래 테스트들이 무는 것은 셋이다:
+#   (a) 부재는 정말로 캐시된다 (비용이 실제로 사라졌다),
+#   (b) 그럼에도 ``active_decoder_backend()`` 는 stale 값을 보고하지 않는다,
+#   (c) 캐시는 명시적 지점에서 무효화된다 (register / set / reset).
+
+
+def test_missing_cv2_import_is_probed_only_once() -> None:
+    """부재가 캐시되어 프레임마다 ``sys.path`` 전수 탐색이 반복되지 않는다."""
+    image = encode_frame(b"x")
+
+    with blocked_cv2() as blocker:
+        assert decode_frame(image) is None
+        first = blocker.lookups
+        assert first >= 1, "전제 실패: blocker 가 import 시도를 보지 못했다"
+
+        # 이후 프레임들은 캐시된 '부재' 판정을 쓰므로 import 를 다시 시도하지 않는다.
+        for _ in range(20):
+            assert decode_frame(image) is None
+        assert blocker.lookups == first
+
+
+def test_active_backend_is_never_stale_cv2() -> None:
+    """캐시가 있어도 ``active_decoder_backend()`` 가 stale ``"cv2"`` 를 보고하지 않는다.
+
+    M11-T01 이 지킨 성질 그대로다: cv2 가 있는 상태에서 성공 경로를 **먼저 데우고**
+    (여기서 모듈 객체를 캐시했다면 이후 보고가 낡는다) 곧바로 부재로 전환했을 때,
+    무효화 호출 **없이도** 즉시 ``None`` 이어야 한다 — 캐시되는 것은 성공이 아니라
+    실패뿐이므로 낙관적 방향으로는 결코 낡지 않는다.
+    """
+    # 성공 경로를 데운다 (cv2 가용 + 실제 디코드까지).
+    assert active_decoder_backend() == "cv2"
+    payload = b"warm the success path"
+    assert decode_frame(encode_frame(payload)) == payload
+
+    with blocked_cv2():
+        # 아무 무효화도 부르지 않았는데 즉시 반영된다.
+        assert active_decoder_backend() is None
+        assert decode_frame(encode_frame(payload)) is None
+
+    # 차단 해제 + 무효화 후 회복 (blocked_cv2 가 나가면서 무효화한다).
+    assert active_decoder_backend() == "cv2"
+    assert decode_frame(encode_frame(payload)) == payload
+
+
+def test_reset_probe_reinstates_cv2_after_absence_was_cached() -> None:
+    """부재 캐시는 :func:`reset_decoder_backend_probe` 로 무효화된다."""
+    with blocked_cv2(reset_on_exit=False):
+        assert active_decoder_backend() is None  # 부재가 캐시된다
+
+    # 무효화 전: 보수적으로 여전히 '없음' 이다 (낙관 방향으로 낡지 않는다는 성질의 대가).
+    assert active_decoder_backend() is None
+
+    reset_decoder_backend_probe()
+
+    assert active_decoder_backend() == "cv2"
+    payload = b"recovered by reset"
+    assert decode_frame(encode_frame(payload)) == payload
+
+
+def test_registry_calls_invalidate_the_probe_cache() -> None:
+    """``set_decoder_backend`` / ``register_decoder_backend`` 도 무효화 지점이다."""
+    with blocked_cv2(reset_on_exit=False):
+        assert active_decoder_backend() is None
+
+    set_decoder_backend(None)  # 명시적 재설정 = 가용성 재판정 신호
+    assert active_decoder_backend() == "cv2"
+
+    with blocked_cv2(reset_on_exit=False):
+        assert active_decoder_backend() is None
+
+    register_decoder_backend("late-arrival", lambda: (lambda image: b"late"))
+    assert active_decoder_backend() == "cv2"
+
+
+def test_reset_probe_is_idempotent_and_safe_to_call_anytime() -> None:
+    """무효화는 스스로 probe 하지 않으며 몇 번을 불러도 계약이 그대로다."""
+    reset_decoder_backend_probe()
+    reset_decoder_backend_probe()
+    assert active_decoder_backend() == "cv2"
+    payload = b"still fine"
     assert decode_frame(encode_frame(payload)) == payload

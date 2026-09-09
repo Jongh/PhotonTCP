@@ -56,18 +56,29 @@ raises ``ImportError`` — same as :mod:`photontcp.mobile.kivy_devices`.
 ``import photontcp.mobile`` keeps working there, which is what M11 completion
 criterion 6 requires.
 
-확인 필요 (no Kivy install and no Android device were available here)
-====================================================================
+확인 필요 (still unverified — no Android device, and no webcam on the dev machine)
+================================================================================
+
+M12-T02 ran this app on a **desktop** Kivy install (2.3.1 / SDL2 / OpenGL 4.6) and
+closed two of the items that used to be listed here:
+
+* the widget tree builds and renders, and pressing Start with no ``camera4kivy``
+  ends in a status-line message rather than a crash;
+* ``Preview.connect_camera(enable_analyze_pixels=True, camera_id=…)`` accepts
+  those keyword names on camera4kivy 0.3.3 (no ``TypeError``).
+
+What is still unverified is below. The desktop machine had **no webcam**, so the
+pixel callback was never invoked, and Android's GLES backend is a separate
+question from the desktop one.
 
 * ``camera4kivy``'s ``Preview.analyze_pixels_callback(self, pixels, image_size,
   image_pos, scale, mirror)`` signature and its RGBA row order. The subclass
   below absorbs signature drift with ``*args``/``**kwargs`` and only relies on
   the first two parameters, but the *row order* (and therefore whether
   ``flip_vertical`` must be set) is unverified.
-* ``connect_camera(enable_analyze_pixels=True, camera_id=…)`` keyword names —
-  the call is made defensively and degrades to a plain ``connect_camera()``.
 * Whether an Android GLES backend accepts the ``"luminance"`` texture format
-  ``KivyDisplay`` uploads by default (see that class's docstring).
+  ``KivyDisplay`` uploads by default (see that class's docstring). The **desktop**
+  GL backend does accept it (M12-T02); GLES is a separate implementation.
 * Whether CameraX/``camera4kivy`` **recycles** the analysis buffer after the
   callback returns. ``KivyCamera`` copies on submit by default
   (``copy_on_submit``) so recycling cannot tear a frame either way; what is

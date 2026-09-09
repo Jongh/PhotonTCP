@@ -35,6 +35,13 @@ Selection rule: an explicit :func:`set_decoder_backend` name wins; otherwise
 backends are probed in registration order and the first available one is used.
 ``set_decoder_backend(None)`` returns to that automatic selection.
 
+Backend *availability* is re-probed on every :func:`decode_frame` (so
+:func:`active_decoder_backend` is never stale in the optimistic direction), with
+one exception for cost: a cv2 import that has already failed is remembered, so
+an opencv-less build does not re-walk ``sys.path`` per frame.
+:func:`reset_decoder_backend_probe` clears that memory, and the two registry
+calls above clear it implicitly. See :func:`_require_cv2` (M12-T03).
+
 A backend callable is invoked as ``backend(image)``. If its signature also
 accepts a ``detector`` parameter (as the cv2 backend does), a ``detector=``
 argument handed to :func:`decode_frame` is forwarded to it; backends that do
@@ -103,6 +110,7 @@ __all__ = [
     "register_decoder_backend",
     "set_decoder_backend",
     "active_decoder_backend",
+    "reset_decoder_backend_probe",
 ]
 
 # A decoder backend: image -> recovered bytes (or None if undecodable).
@@ -143,6 +151,11 @@ _ALT_UNRESOLVED = object()
 _alt_kind = _ALT_UNRESOLVED
 _alt_kind_lock = threading.Lock()
 
+# Negative cache for the lazy cv2 import (M12-T03). ``True`` means "we probed
+# and cv2 is NOT importable here"; see :func:`_require_cv2` for why only the
+# failure is cached and :func:`reset_decoder_backend_probe` for invalidation.
+_cv2_missing = False
+
 
 # --------------------------------------------------------------------------
 # Lazy cv2 access
@@ -154,15 +167,58 @@ def _require_cv2() -> Any | None:
 
     The import is deliberately *not* done at module import time (M11): a
     platform without OpenCV must still be able to ``import photontcp.qr``.
-    ``sys.modules`` makes the successful case a dict lookup, so calling this on
-    every frame is cheap; the failing case is slow but only happens where
-    decoding is impossible anyway.
+
+    **Success is not cached** — ``sys.modules`` already makes a successful
+    ``import cv2`` a dict lookup, and caching the module object would let
+    :func:`active_decoder_backend` report a stale ``"cv2"`` after OpenCV became
+    unimportable (the property M11-T01 protected and
+    ``test_cv2_backend_returns_after_block_is_lifted`` asserts).
+
+    **Failure IS cached** (M12-T03 / M11-review minor 8). A failed import is
+    *not* recorded in ``sys.modules``, so without this flag every single
+    ``decode_frame`` call re-walks the whole ``sys.path`` (plus every finder on
+    ``sys.meta_path``) only to fail again. That state is precisely the standing
+    condition of the opencv-less Android build ``docs/mobile-build.md`` 5-3
+    recommends, so the cost would land exactly on the path the docs advise.
+    Caching the *absence* can never produce a stale ``"cv2"`` — the only
+    direction that mattered — it can only be conservatively pessimistic, and
+    that is invalidated at every explicit point where the caller signals the
+    environment may have changed (see :func:`reset_decoder_backend_probe`).
     """
+    global _cv2_missing
+    if _cv2_missing:
+        return None
     try:
         import cv2  # noqa: PLC0415 - intentional lazy import (see docstring)
     except Exception:  # noqa: BLE001 - any import failure = cv2 unavailable
+        _cv2_missing = True
         return None
     return cv2
+
+
+def reset_decoder_backend_probe() -> None:
+    """Forget cached backend *capability probes* so they are re-run on demand.
+
+    Two probes are cached inside this module for cost reasons: the "cv2 is not
+    importable here" flag (:func:`_require_cv2`) and the alternate-detector kind
+    (:func:`_alt_kind_cached`). Both are properties of the *environment*, not of
+    a frame, so they are resolved at most once — which means a process that
+    changes its environment mid-run (installing OpenCV, mutating ``sys.path``
+    or ``sys.meta_path``, or a test simulating cv2's absence) must say so.
+
+    This is that explicit invalidation point. It is also called automatically
+    from :func:`register_decoder_backend` and :func:`set_decoder_backend`, since
+    reconfiguring the registry is the ordinary moment at which a caller's belief
+    about backend availability changes.
+
+    Cheap and idempotent: it clears flags, it does not probe anything itself.
+    Note that only the *negative* cv2 result is ever cached, so availability can
+    never be reported staler than "unavailable" even without calling this.
+    """
+    global _cv2_missing, _alt_kind
+    _cv2_missing = False
+    with _alt_kind_lock:
+        _alt_kind = _ALT_UNRESOLVED
 
 
 # --------------------------------------------------------------------------
@@ -424,6 +480,9 @@ _BACKEND_FACTORIES: dict[str, DecoderBackendFactory] = {}
 # simulating cv2's absence) is reflected immediately by
 # ``active_decoder_backend()``. Factories are contractually cheap — the cv2 one
 # is a ``sys.modules`` lookup — so re-probing per frame costs nothing material.
+# (The one thing that *is* cached is the cv2 *absence* flag inside
+# ``_require_cv2``, which keeps the failing import off the per-frame path
+# without ever making availability look better than it is; see M12-T03.)
 _ACCEPTS_DETECTOR: dict[DecoderBackend, bool] = {}
 _SELECTED_BACKEND: str | None = None
 _BACKEND_LOCK = threading.Lock()
@@ -455,6 +514,9 @@ def register_decoder_backend(name: str, factory: DecoderBackendFactory) -> None:
         raise TypeError("backend factory must be callable")
     with _BACKEND_LOCK:
         _BACKEND_FACTORIES[name] = factory
+    # Reconfiguring the registry is an explicit "availability may have changed"
+    # signal — drop the cached capability probes (M12-T03).
+    reset_decoder_backend_probe()
 
 
 def set_decoder_backend(name: str | None) -> None:
@@ -472,6 +534,8 @@ def set_decoder_backend(name: str | None) -> None:
     if name is not None and name not in _BACKEND_FACTORIES:
         raise ValueError(f"unknown decoder backend: {name!r}")
     _SELECTED_BACKEND = name
+    # Same explicit invalidation point as ``register_decoder_backend`` (M12-T03).
+    reset_decoder_backend_probe()
 
 
 def _resolve_one(name: str) -> tuple[DecoderBackend, bool] | None:
