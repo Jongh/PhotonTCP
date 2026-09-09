@@ -103,7 +103,8 @@ except ImportError:
     raise SystemExit(0)
 
 from photontcp.app import ChatMessage, ChatSession  # noqa: E402
-from photontcp.optical import OpticalChannel  # noqa: E402
+from photontcp.optical import OpticalChannel, run_peer  # noqa: E402
+from photontcp.optical import peer  # noqa: E402  (single source for the tuning constants)
 from photontcp.qr.encode import encode_frame  # noqa: E402
 from photontcp.session import (  # noqa: E402
     ManualClock,
@@ -120,32 +121,40 @@ SEED = 5
 #: resolution floor.
 SCALE = 6
 
+# The session-drive tuning constants below are RE-EXPORTED from
+# photontcp.optical.peer, which is the single source now that run_peer owns the
+# real two-peer drive (M11-T02). Copying the values here would let the in-memory
+# demo and the real --role drive diverge silently when one side is retuned
+# (M11-review 사소 12); the in-memory demo further down still uses them, so they
+# are bound to names rather than deleted.
 #: Virtual seconds advanced per pump round. Must exceed the control RTO so any
 #: unacknowledged handshake/close frame would be retransmitted each round.
-ROUND_DT = 0.6
+ROUND_DT = peer.ROUND_DT
 
 #: Real wall-clock pause per pump round. UNLIKE qr_loopback.py, the optical
 #: channel delivers on a background capture thread, so we give that thread a brief
 #: real moment to capture+decode+enqueue a shown frame before pumping the receiver
 #: (Session.pump polls recv_frame(timeout=0), so it does not block waiting).
+#: Local to this demo: run_peer's equivalent is its ``hold`` argument.
 ROUND_SLEEP = 0.03
 
 #: Heartbeat / idle-timeout window.
-HEARTBEAT_INTERVAL = 5.0
-IDLE_TIMEOUT = 120.0
+HEARTBEAT_INTERVAL = peer.HEARTBEAT_INTERVAL
+IDLE_TIMEOUT = peer.IDLE_TIMEOUT
 
 # Hard upper bounds so no pump loop can ever run forever (round cap AND a
 # wall-clock deadline, since this demo also burns real time per round).
-MAX_HANDSHAKE_ROUNDS = 200
-MAX_CHAT_ROUNDS = 200
-MAX_CLOSE_ROUNDS = 200
+MAX_HANDSHAKE_ROUNDS = peer.MAX_HANDSHAKE_ROUNDS
+MAX_CHAT_ROUNDS = peer.MAX_CHAT_ROUNDS
+MAX_CLOSE_ROUNDS = peer.MAX_CLOSE_ROUNDS
 #: Absolute wall-clock budget for the whole session drive (belt-and-suspenders
 #: against any capture-thread stall).
-WALL_DEADLINE_S = 60.0
+WALL_DEADLINE_S = peer.DEFAULT_TIMEOUT
 
 #: Tiny message sets -- QR decode is slow, so keep both bodies and counts small.
-MESSAGES_A = ["hi over light", "frame two"]
-MESSAGES_B = ["got your light", "B done"]
+#: Same single source: run_peer's DEFAULT_MESSAGES is the (A, B) pair.
+MESSAGES_A = list(peer.DEFAULT_MESSAGES[0])
+MESSAGES_B = list(peer.DEFAULT_MESSAGES[1])
 
 
 def _advance_both(clock_a: ManualClock, clock_b: ManualClock, dt: float) -> None:
@@ -405,9 +414,10 @@ def _drive_real_peer(args: argparse.Namespace) -> int:
     two screens/cameras facing each other, to close the optical loop physically.
 
     ``--role sender`` is the initiator; ``--role receiver`` is the responder. The
-    same handshake -> tiny messages -> graceful close progression as the in-memory
-    demo is driven, but every frame really travels over light. Returns a process
-    exit code (0 = success, or a graceful no-hardware exit).
+    session drive itself lives in :func:`photontcp.optical.run_peer` (headless, so
+    the Kivy mobile app reuses it); THIS function only builds the real devices and
+    prints, turning ``run_peer``'s ``on_event`` callbacks into console lines.
+    Returns a process exit code (0 = success, or a graceful no-hardware exit).
     """
     # Import the cv2-backed devices lazily and only for the real role mode so the
     # default in-memory path never depends on a working GUI/camera.
@@ -444,115 +454,81 @@ def _drive_real_peer(args: argparse.Namespace) -> int:
 
     chan = OpticalChannel(display, camera, scale=args.scale, hold=args.hold)
 
-    started = time.perf_counter()
-    deadline = started + WALL_DEADLINE_S
-
     print("\n[0] QR encoding proof (data -> real QR image over light)")
     _show_qr_proof()
 
-    clock = ManualClock()
-    session = Session(
-        chan,
-        clock,
-        is_initiator=is_initiator,
-        session_id=1 if is_initiator else 0,
-        isn=1000 if is_initiator else 5000,
-        heartbeat_interval=HEARTBEAT_INTERVAL,
-        idle_timeout=IDLE_TIMEOUT,
-    )
-    chat = ChatSession(session, clock)
+    def on_event(kind: str, detail: dict) -> None:
+        """Render one ``run_peer`` progress event as the console line it used to print."""
+        if kind == "connect":
+            print("\n[1] Handshake over the REAL optical link (display + camera)")
+            if detail["is_initiator"]:
+                print("    A.connect() -> SYN shown as a QR frame, captured by the peer")
+            else:
+                print("    waiting to capture the peer's SYN over light...")
+        elif kind == "handshake":
+            if detail["established"]:
+                print(
+                    f"    => this peer ESTABLISHED after {detail['rounds']} pump round(s)"
+                )
+                print("\n[2] Exchange tiny messages over light")
+        elif kind == "sent":
+            print(
+                f"    this peer sends msg#{detail['msg_id']} over light: {detail['text']}"
+            )
+        elif kind == "received":
+            print(f"    [recv] msg#{detail['msg_id']}: {detail['text']}")
+        elif kind == "match":
+            print(
+                f"    received {detail['received']}/{detail['expected']} "
+                f"-> {'MATCH' if detail['match'] else 'MISMATCH'}"
+            )
+        elif kind == "closing":
+            print("\n[3] Graceful close over the REAL optical link")
+            if detail["is_initiator"]:
+                print("    A.close() -> FIN shown as a QR frame")
+        elif kind == "closed":
+            if detail["closed"]:
+                print(f"    => this peer CLOSED after {detail['rounds']} pump round(s)")
+        elif kind == "error":
+            level = "ERROR" if detail["stage"] == "handshake" else "WARNING"
+            print(f"    {level}: {detail['message']}")
 
-    established = False
-    messages_matched = False
-    closed = False
     try:
-        # --- [1] Handshake over the real optical link. ------------------- #
-        print("\n[1] Handshake over the REAL optical link (display + camera)")
-        if is_initiator:
-            print("    A.connect() -> SYN shown as a QR frame, captured by the peer")
-            chat.connect()
-        else:
-            print("    waiting to capture the peer's SYN over light...")
-        for rnd in range(1, MAX_HANDSHAKE_ROUNDS + 1):
-            if time.perf_counter() > deadline:
-                break
-            clock.advance(ROUND_DT)
-            time.sleep(args.hold)
-            chat.pump()
-            if chat.is_established:
-                print(f"    => this peer ESTABLISHED after {rnd} pump round(s)")
-                established = True
-                break
-        if not established:
-            print("    ERROR: handshake did not complete within the cap/deadline")
-            return 1
-
-        # --- [2] Exchange a couple of tiny messages over light. ---------- #
-        print("\n[2] Exchange tiny messages over light")
-        out_msgs = MESSAGES_A if is_initiator else MESSAGES_B
-        expect = len(MESSAGES_B if is_initiator else MESSAGES_A)
-        next_out = 0
-        for _rnd in range(1, MAX_CHAT_ROUNDS + 1):
-            if time.perf_counter() > deadline:
-                break
-            clock.advance(ROUND_DT)
-            time.sleep(args.hold)
-            if next_out < len(out_msgs):
-                mid = chat.send_message(out_msgs[next_out])
-                print(f"    this peer sends msg#{mid} over light: {out_msgs[next_out]}")
-                next_out += 1
-            got = chat.pump()
-            _print_arrivals("[recv]", got)
-            if next_out >= len(out_msgs) and len(chat.received) >= expect:
-                break
-        recv_texts = _texts(chat.received)
-        expected_texts = MESSAGES_A if is_initiator else MESSAGES_B
-        # Each peer receives the OTHER peer's outgoing set.
-        expected_in = MESSAGES_B if is_initiator else MESSAGES_A
-        messages_matched = recv_texts == expected_in
-        print(
-            f"    received {len(recv_texts)}/{len(expected_in)} "
-            f"-> {'MATCH' if messages_matched else 'MISMATCH'}"
+        result = run_peer(
+            chan,
+            role,
+            messages=(MESSAGES_A, MESSAGES_B),
+            timeout=WALL_DEADLINE_S,
+            hold=args.hold,
+            on_event=on_event,
         )
-
-        # --- [3] Graceful close over the real optical link. -------------- #
-        print("\n[3] Graceful close over the REAL optical link")
-        if is_initiator:
-            print("    A.close() -> FIN shown as a QR frame")
-            chat.close()
-        for rnd in range(1, MAX_CLOSE_ROUNDS + 1):
-            if time.perf_counter() > deadline:
-                break
-            clock.advance(ROUND_DT)
-            time.sleep(args.hold)
-            chat.pump()
-            if chat.is_closed:
-                print(f"    => this peer CLOSED after {rnd} pump round(s)")
-                closed = True
-                break
-        if not closed:
-            print("    WARNING: this peer did not reach CLOSED within the cap/deadline")
     finally:
-        # Always stop the background capture thread and release the real devices.
+        # run_peer normally closes the channel itself, but it validates its
+        # arguments BEFORE taking ownership (e.g. --hold 0 raises straight away),
+        # so on that path the capture thread would be left to the daemon flag.
+        # OpticalChannel.close() is idempotent, so closing here too is free and
+        # makes cleanup unconditional. The DEVICES are ours in every case.
         chan.close()
         display.close()
         camera.close()
 
-    elapsed = time.perf_counter() - started
-    ok = established and messages_matched and closed
+    if not result.established:
+        return 1
+
     print("\n" + "-" * 68)
     print(
         f"Summary: REAL OpticalChannel role={role} | "
-        f"established={established} | messages={'MATCH' if messages_matched else 'MISMATCH'} "
-        f"| closed={closed} | wall={elapsed:.2f}s"
+        f"established={result.established} | "
+        f"messages={'MATCH' if result.messages_match else 'MISMATCH'} "
+        f"| closed={result.closed} | wall={result.wall_seconds:.2f}s"
     )
-    print(f"result: {'PASS' if ok else 'FAIL'}")
+    print(f"result: {'PASS' if result.passed else 'FAIL'}")
     print(
         "    (a FAIL usually means the OTHER peer was not running the opposite role\n"
         "    facing this screen/camera -- this is a two-process, two-machine demo.)"
     )
     print("-" * 68)
-    return 0 if ok else 1
+    return 0 if result.passed else 1
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:

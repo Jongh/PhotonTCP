@@ -1,5 +1,7 @@
-# tide 로컬 상태 파일 (.tide/deps 는 커밋 대상이므로 무시하지 않음)
+# tide 로컬 상태 파일
+# (.tide/deps · .tide/release-mode · .tide/autonomy 는 커밋 대상이므로 무시하지 않음)
 .tide/phase
+.tide/debug-session
 
 # Python
 __pycache__/
@@ -21,6 +23,15 @@ htmlcov/
 .tox/
 .mypy_cache/
 .ruff_cache/
+
+# 모바일(Android) 빌드 — buildozer
+# bin/ 은 APK 산출물, .buildozer/ 는 프로젝트 로컬 빌드 트리(SDK/NDK·p4a 캐시).
+# 전역 캐시 ~/.buildozer 는 저장소 밖이라 여기서 다루지 않는다.
+bin/
+.buildozer/
+# camera4kivy 가 요구하는 서드파티 p4a 훅 디렉터리(빌드 직전에 clone 한다 —
+# docs/mobile-build.md 0-2절). 이 저장소가 소유하지 않으므로 커밋하지 않는다.
+camerax_provider/
 
 # 에디터 / OS
 .vscode/

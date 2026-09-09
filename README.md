@@ -113,6 +113,50 @@ python examples/qr_decode_bench.py
 이렇게 높아진 실 디코드율은 v1.0 사인오프 게이트의 **셀프체크 수신율 ≥ 80%** 통과 여유를
 키워, 동일 조명·정렬 조건에서 게이트를 더 쉽게 넘게 합니다.
 
+### 모바일(Android) (M11)
+
+M11에서 **안드로이드 폰이 한 피어로 동작**할 수 있게 되었습니다. 폰이 자기 화면으로 QR을 띄우고
+자기 카메라로 상대 QR을 잡아, PC와 마주 놓으면 "화면 2 + 카메라 2"가 성립합니다 — v1.0 사인오프
+체크 B(2-머신 왕복)에 두 번째 PC가 없어도 되는 셈입니다.
+
+- `photontcp/mobile/`: `KivyDisplay`(`DisplaySink`) + `KivyCamera`(`CameraSource`) 어댑터와
+  Kivy 앱 골격(`PhotonTCPApp`). 세션·신뢰성·앱 계층은 **한 줄도 바뀌지 않았습니다**(`Channel`
+  인터페이스만 의존). Kivy 미설치 데스크톱에서도 `import photontcp.mobile`은 성공하며, 두 어댑터와
+  앱 진입점은 `None`으로 노출됩니다(`photontcp/optical/__init__.py`의 cv2 가드와 동형).
+- `photontcp/optical/peer.py`의 `run_peer(channel, role, …)`: 핸드셰이크→메시지 교환→정상 종료
+  구동 루프가 UI/argparse와 분리되어, CLI 예제(`examples/optical_link.py`)와 모바일 앱이 **같은
+  코드**를 씁니다. 진행 상황은 `on_event(kind, detail)` 콜백으로만 흘러 라이브러리가 print하지
+  않습니다.
+- **디코더 백엔드 seam**: `qr/decode.py`가 cv2를 **지연 import**하고, 디코더를 이름으로 등록·선택할
+  수 있습니다(`register_decoder_backend` / `set_decoder_backend` / `active_decoder_backend`).
+  cv2가 없는 플랫폼에서도 패키지가 import되고 `decode_frame`은 예외 대신 `None`을 돌려줍니다
+  (None 계약·never-raise 불변). 이는 p4a의 무거운 opencv 레시피가 실패할 때를 위한 위험 분산입니다.
+- 개발 설치: `pip install photontcp[mobile]` (Kivy·camera4kivy).
+
+**빌드 방법**: [`docs/mobile-build.md`](docs/mobile-build.md) — Docker 경로와 WSL2 경로를 각각
+명령 단위로, `adb install` 절차와 실패 시 로그 위치까지 적어 두었습니다. 설정의 단일 원본은
+[`buildozer.spec`](buildozer.spec)입니다.
+
+#### 현재 한계 (정직하게)
+
+- **실기 사인오프 실측은 아직 수행되지 않았습니다.** 폰+PC 체크 B 절차는
+  [`docs/v1.0-signoff.md`](docs/v1.0-signoff.md)에 적혀 있지만, 실제로 돌려 수신율·요약 줄을
+  기록하는 일은 **다음 사이클 항목**입니다. 따라서 v1.0은 아직 주장하지 않습니다.
+- **camera4kivy는 아카이브(유지보수 중단) 상태**입니다. CameraX 프리뷰의 픽셀 콜백 시그니처와
+  RGBA 행 순서, 그리고 **분석 버퍼의 재사용 여부**는 문서 기준으로 구현했을 뿐 **기기에서
+  검증되지 않았습니다**. 버퍼 재사용은 조용한 디코드 실패로 나타나므로 `KivyCamera`는 기본으로
+  제출 시점에 버퍼를 복사합니다(`copy_on_submit=True` — 콜백 스레드의 memcpy 한 장).
+- 그래서 `KivyCamera(flip_vertical=…, flip_horizontal=…)`와 `KivyDisplay(colorfmt=…,
+  flip_vertical=…)`의 기본값은 **실기 확인이 필요**합니다. QR은 상하/좌우가 뒤집히면 디코드되지
+  않으므로, 첫 실기 실행에서 디코드가 0이면 이 플래그부터 뒤집어 보십시오. 안드로이드 GLES
+  백엔드가 `luminance` 텍스처를 받는지도 미검증이며, 거부되면 `colorfmt="rgb"`로 바꿉니다.
+- APK에 opencv를 넣을지는 `buildozer.spec`에 사유와 함께 명시돼 있습니다. 레시피가 실패해
+  opencv를 빼면 앱은 뜨지만 **QR을 한 장도 디코드하지 못해** 광학 링크가 성립하지 않습니다
+  (우회 절차와 그 의미는 `docs/mobile-build.md` 5-3 참조). 대체 디코더 백엔드(ZXing 등)의 실제
+  구현은 이번 범위 밖이며, 백엔드를 꽂을 *자리*만 만들어져 있습니다.
+- 앱 UX는 골격 수준입니다(설정 영속화·로그 뷰·파일 전송 UI 없음). iOS·서명·스토어 배포도
+  범위 밖입니다.
+
 ## 개발 방식
 
 이 저장소는 [tide](https://github.com/) 개발 사이클(milestone → impl → review → release)을 따릅니다.

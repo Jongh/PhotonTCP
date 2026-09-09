@@ -66,7 +66,8 @@ def build_corpus(seed: int = SEED) -> list[bytes]:
     benchmark exercises many distinct QR symbol versions and content patterns
     (content is what triggers cv2's decode blind spot):
 
-    * short / medium / long random binary payloads;
+    * short (including the former Micro-QR boundary) / medium / long random
+      binary payloads;
     * slices of ``bytes(range(256))`` (every byte value, structured);
     * text-like ASCII payloads;
     * structured "packet-like" payloads (a small fixed header + body) without
@@ -78,17 +79,17 @@ def build_corpus(seed: int = SEED) -> list[bytes]:
     rng = np.random.default_rng(seed)
     corpus: list[bytes] = []
 
-    # Payloads are kept >= 12 bytes on purpose. A base64 string short enough to
-    # land in QR version 1 / Micro-QR (~<=9 raw bytes) is NOT decodable by
-    # ``cv2.QRCodeDetector`` in this build at *any* scale or preprocessing
-    # (cv2 has no Micro-QR support) -- that limitation is orthogonal to the M10
-    # hardening (the cascade operates on the same unreadable symbol), so the
-    # corpus excludes it to keep the clean round-trip a meaningful 100% target.
-    # See tests/test_qr_robustness.py for the boundary measurement.
+    # Payloads used to be floored at 12 bytes because anything shorter was
+    # encoded as a Micro QR (segno's default for short data) and
+    # ``cv2.QRCodeDetector`` has no Micro-QR support, making those frames
+    # undecodable at any scale or preprocessing. M11-T07 removed the cause in
+    # the encoder (``encode_frame`` now pins ``micro=False``), so short payloads
+    # are regular version-1 symbols and belong in the corpus: 5/8/9-byte
+    # lengths are included below and count towards the rates reported here.
 
     # (a) Random binary payloads across a length spectrum. Many short-to-medium
     #     ones (cheap to encode/decode, and where content blind spots show up).
-    for length in (12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512):
+    for length in (5, 8, 9, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512):
         for _ in range(12):
             corpus.append(bytes(rng.integers(0, 256, size=length, dtype=np.uint8)))
 
@@ -108,7 +109,7 @@ def build_corpus(seed: int = SEED) -> list[bytes]:
 
     # (d) "Packet-like" structured payloads: a small fixed-ish header followed
     #     by a random body, packed by hand (no photontcp.packet import needed).
-    for body_len in (4, 16, 40, 80, 160, 320):  # header(9)+body >=12 bytes
+    for body_len in (0, 4, 16, 40, 80, 160, 320):  # header(9) + body
         for _ in range(6):
             header = bytes([
                 1,                                   # version

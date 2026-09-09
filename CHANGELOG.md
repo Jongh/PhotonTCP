@@ -5,6 +5,33 @@
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-09
+
+모바일(Android) 1급 지원. 안드로이드 폰이 자기 화면으로 QR을 띄우고 자기 카메라로 상대 QR을 잡아 **한 피어로 동작**할 수 있는 상태가 됨 — v1.0 사인오프의 체크 B(2-머신 왕복)에 두 번째 PC가 없어도 되는 경로가 열림. 세션·신뢰성·앱 계층은 한 줄도 바뀌지 않음(`Channel` 인터페이스만 의존). 공개 계약(`decode_frame` 시그니처·None 계약, CLI 인자 집합·종료 코드) 불변.
+
+### Added
+
+- **`photontcp.mobile` 패키지**: `KivyDisplay`(`DisplaySink`) + `KivyCamera`(`CameraSource`) 어댑터와 Kivy 앱 골격(`PhotonTCPApp`). `KivyDisplay.show()`는 렌더하지 않고 pending 슬롯 1개에 packing만 한 뒤 메인 스레드 렌더를 예약해 광학 송신 스레드를 막지 않음. `KivyCamera`는 푸시 모델로 최신 1장만 보관(큐 없음 = 지연 누적 원천 차단)하고 제출 시점에 버퍼 소유권을 가져옴(`copy_on_submit`, 카메라 버퍼 재사용으로 인한 프레임 찢김 차단). Kivy 미설치 데스크톱에서도 `import photontcp.mobile`은 성공하며 어댑터·앱 진입점은 `None`으로 노출(`optical/__init__.py`의 cv2 가드와 동형).
+- **`photontcp.optical.peer.run_peer()`**: 핸드셰이크 → 메시지 교환 → 정상 종료 구동 루프를 UI·argparse와 분리한 헤드리스 드라이버. CLI 예제와 모바일 앱이 **같은 코드**를 사용. 진행 상황은 `on_event(kind, detail)` 콜백으로만 흐르고(kind 집합은 `EVENT_KINDS` 상수) 라이브러리는 print하지 않음. `Channel` 인터페이스만 요구해 인메모리 `OpticalChannel.pair()` 위에서 하드웨어 없이 왕복 검증 가능.
+- **디코더 백엔드 seam**: `register_decoder_backend` / `set_decoder_backend` / `active_decoder_backend`. `qr/decode.py`가 cv2를 **지연 import**해 cv2 없는 플랫폼에서도 패키지가 import되고 `decode_frame`은 예외 대신 `None` 반환(None 계약·never-raise 불변). p4a의 무거운 opencv 레시피 실패에 대비한 위험 분산이며, 기존 cv2 경로(전처리 캐스케이드 + 대체 detector 폴백)는 알고리즘 무변경으로 `"cv2"` 백엔드에 이식.
+- **APK 빌드 파이프라인**: `buildozer.spec`(진입점 `main.py`, `requirements`에 opencv 포함 사유 주석, `android.permissions = CAMERA, WAKE_LOCK`, `android.wakelock = True`, `android.archs = arm64-v8a`, api 33/minapi 24) + `docs/mobile-build.md`(Docker 경로·WSL2 경로를 각각 명령 단위로, `adb install` 절차, 실패 진단표, opencv 우회).
+- 테스트 59건 추가 — 백엔드 seam 13, `run_peer` 17, 모바일 어댑터 18(+1 skip), 버전 단일 원본 7 등.
+
+### Changed
+
+- **Micro-QR 블라인드스폿을 인코더에서 원천 제거**: `encode_frame`이 `segno.make(..., micro=False)`로 **일반 QR만** 내보냄. `cv2.QRCodeDetector`는 Micro QR을 디코드하지 못하므로 이것은 튜닝 값이 아니라 **코덱 불변식**이며, `micro`를 인자로 열지 않음. 5·8·9바이트 페이로드가 이제 100% 왕복하고, 코퍼스 하한(12B) 제약을 테스트·벤치 양쪽에서 해제(207→249프레임). 실 패킷 경로(≥22B)의 심볼 크기는 불변임을 segno designator 비교로 실측 확인.
+- **버전 선언처를 하나로**: `photontcp/__init__.py`의 하드코딩 상수(`0.1.0`, pyproject와 불일치)를 제거하고 `pyproject.toml`에서 파생. 소스 트리에서는 파일을 먼저 보고(설치 배포판에서만 `importlib.metadata`), 둘 다 없으면 `"0+unknown"`. 두 값이 갈라지면 실패하는 테스트가 이를 기계적으로 고정.
+- `examples/optical_link.py`가 세션 구동을 `run_peer`에 위임하고 출력·종료 코드만 담당. 튜닝 상수도 `photontcp.optical.peer`에서 재수출해 실모드와 인메모리 데모가 갈라지지 않게 함. **CLI 계약은 완전 불변**(`--help` 인자 집합 diff 무출력, 기본 실행 exit 0, `--role` 단독 exit 2).
+- `run_peer`가 `hold <= 0`과 잘못된 `messages` 형태를 `ValueError`로 거부 — 0 페이싱은 채널의 캡처 스레드를 굶겨 **반드시 실패하는** 세션이므로 돌리지 않고 막음.
+
+### Notes
+
+- 신규 59 테스트 추가(전체 247 passed·1 skipped, 회귀 0). 벤치: clean 249/249 = 100%, degraded 249/249 = 100%, `full >= base-only on every set: YES`.
+- **APK 실빌드는 미수행** — 마일스톤이 규정한 폴백 경로(툴체인 상태·미충족 사전조건 기록)를 적용. 스펙·문서·앱·어댑터까지 갖췄고 남은 것은 실행이며, **opencv p4a 레시피가 통과하는지가 이 이식의 최대 불확실성**으로 남음.
+- **실기 검증 전무**: Kivy·camera4kivy 미설치, 안드로이드 기기 없음. 미검증 항목 — camera4kivy 콜백 시그니처·RGBA 행 순서·분석 버퍼 재사용 여부, Android GLES의 `luminance` 텍스처 수용, `flip_vertical`/`flip_horizontal` 기본값 정합성, wakelock 실동작. **뒤집힌 QR은 디코드되지 않으므로 flip 플래그가 실기 첫 확인 항목.**
+- **v1.0은 이번에도 주장하지 않음** — 실 카메라 셀프체크 수신율 ≥80% + 2-머신 왕복 사인오프는 여전히 미수행. 폰+PC 조합 절차가 `docs/v1.0-signoff.md` 2-B에 추가됨.
+- **후속(리뷰 이월)**: cv2 부재 시 실패 import 반복(가용성 캐시 ↔ `active_decoder_backend()` live 보고의 트레이드오프), `photontcp.optical`의 eager `app`/`session` import, `unregister_decoder_backend()`/`registered_decoder_backends()` 짝 API, `run_peer(should_stop=…)` 취소 훅.
+
 ## [0.10.0] - 2026-06-23
 
 cv2 QR 디코드 견고화(로드맵 후속). 카메라가 잡은 QR 프레임의 디코드 성공률을 끌어올려, v1.0 사인오프의 셀프체크 수신율 게이트 통과 여유를 키움. 공개 디코드 API·시그니처 불변.

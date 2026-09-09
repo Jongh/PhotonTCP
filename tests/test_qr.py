@@ -47,6 +47,24 @@ def test_roundtrip_bytes(data: bytes) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 1-b. 짧은 페이로드 라운드트립 (구 Micro-QR 사각지대, M11-T07)
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("length", [5, 8, 9])
+def test_roundtrip_short_payload(length: int) -> None:
+    """5·8·9바이트 페이로드가 100% 왕복한다.
+
+    segno 는 짧은 데이터에 기본으로 Micro QR(M3/M4)을 고르는데
+    ``cv2.QRCodeDetector`` 는 Micro QR 을 디코드하지 못한다.
+    ``encode_frame`` 이 ``micro=False`` 를 고정하므로 이 길이들도
+    일반 version-1 심볼이 되어 왕복한다(회귀 시 여기서 깨진다).
+    """
+    for i in range(10):
+        data = bytes((i * 37 + j * 11 + length) % 256 for j in range(length))
+        assert decode_frame(encode_frame(data)) == data
+
+
+# --------------------------------------------------------------------------- #
 # 2. 실제 Packet 통과 (CRC 포함 전체 필드 복원)
 # --------------------------------------------------------------------------- #
 

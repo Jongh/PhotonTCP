@@ -39,13 +39,15 @@ from photontcp.qr.decode import decode_frame  # noqa: E402
 
 SEED = 0xB10C5  # fixed -> corpus and pass counts are reproducible.
 
-# Payloads are kept >= 12 bytes. A base64 string short enough to fit QR
-# version 1 / Micro-QR (<= ~9 raw bytes) is NOT decodable by
-# ``cv2.QRCodeDetector`` in this build at any scale (no Micro-QR support). That
-# limitation is orthogonal to the M10 hardening (the cascade runs on the same
-# unreadable symbol), so the corpus stays above it to keep the clean target an
-# honest 100%. The boundary is asserted in ``test_micro_qr_boundary_excluded``.
-_MIN_LEN = 12
+# The corpus used to be floored at 12 bytes because shorter payloads were
+# encoded as Micro QR (segno's default for short data) and ``cv2.QRCodeDetector``
+# has no Micro-QR support -- they were undecodable at any scale. M11-T07 removed
+# that at the source: ``encode_frame`` now always emits a *regular* QR symbol
+# (``micro=False``), so the former blind spot is ordinary corpus territory. The
+# floor is therefore lowered to the shortest payload we care about, and short
+# lengths are part of the spectrum below. ``test_short_payloads_roundtrip`` pins
+# the boundary itself.
+_MIN_LEN = 5
 
 
 # --------------------------------------------------------------------------- #
@@ -58,7 +60,7 @@ def _build_corpus(seed: int = SEED) -> list[bytes]:
     corpus: list[bytes] = []
 
     # Random binary across a length spectrum.
-    for length in (12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384):
+    for length in (5, 8, 9, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384):
         for _ in range(6):
             corpus.append(bytes(rng.integers(0, 256, size=length, dtype=np.uint8)))
 
@@ -196,30 +198,49 @@ def test_blind_spot_recovered_by_full_decode() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 4. Document/guard the Micro-QR boundary the corpus deliberately avoids
+# 4. The former Micro-QR boundary is now covered, not excluded
 # --------------------------------------------------------------------------- #
 
-def test_micro_qr_boundary_excluded() -> None:
-    """A <=9-byte payload lands in Micro-QR, which cv2 cannot decode here.
+def test_short_payloads_roundtrip() -> None:
+    """5/8/9-byte payloads -- the old Micro-QR blind spot -- round-trip at 100%.
 
-    This is the reason the corpus stays >= 12 bytes. Asserting it keeps the
-    rationale honest: if a future cv2/build starts decoding Micro-QR, this test
-    surfaces the change rather than silently widening the corpus.
+    Before M11-T07 these lengths were *excluded* from the corpus: segno encoded
+    them as Micro QR (M3/M4) and ``cv2.QRCodeDetector`` cannot decode Micro QR,
+    so they failed at any scale. ``encode_frame`` now pins ``micro=False``, so
+    the same payloads become regular version-1 symbols and decode.
+
+    This test therefore asserts the *opposite* of its predecessor
+    (``test_micro_qr_boundary_excluded``): the boundary is covered, not avoided.
+    A regression that lets a Micro symbol back out of the encoder fails here.
     """
     rng = np.random.default_rng(SEED ^ 0xFF)
-    tiny_fail = 0
-    safe_ok = 0
     n = 20
-    for _ in range(n):
-        tiny = bytes(rng.integers(0, 256, size=8, dtype=np.uint8))
-        if decode_frame(encode_frame(tiny)) != tiny:
-            tiny_fail += 1
-        safe = bytes(rng.integers(0, 256, size=_MIN_LEN, dtype=np.uint8))
-        if decode_frame(encode_frame(safe)) == safe:
-            safe_ok += 1
-    # >= 12-byte payloads always round-trip; 8-byte (Micro-QR) reliably do not.
-    assert safe_ok == n, f"expected all >={_MIN_LEN}B payloads to decode, got {safe_ok}/{n}"
-    assert tiny_fail == n, (
-        f"expected all 8B (Micro-QR) payloads to fail in this cv2 build, "
-        f"got {n - tiny_fail}/{n} unexpectedly decoding"
+    failures: list[tuple[int, int]] = []  # (length, attempt index)
+    for length in (5, 8, 9):
+        for i in range(n):
+            payload = bytes(rng.integers(0, 256, size=length, dtype=np.uint8))
+            if decode_frame(encode_frame(payload)) != payload:
+                failures.append((length, i))
+    assert not failures, (
+        f"{len(failures)}/{3 * n} short-payload frames failed to round-trip "
+        f"(lengths: {sorted({length for length, _ in failures})}); the encoder "
+        "may have started emitting Micro QR again"
     )
+
+
+def test_encoder_never_emits_micro_qr() -> None:
+    """The encoder's symbol is a regular QR (>= 21 modules), never Micro.
+
+    Micro QR symbols are 11/13/15/17 modules square (M1..M4); the smallest
+    regular symbol (version 1) is 21. Measuring the module count straight off
+    the rendered bitmap pins the invariant without reaching into segno.
+    """
+    scale, border = 4, 4
+    for length in (1, 5, 8, 9, 12):
+        payload = bytes(range(1, length + 1))
+        image = encode_frame(payload, scale=scale, border=border)
+        modules = image.shape[0] // scale - 2 * border
+        assert modules >= 21, (
+            f"{length}-byte payload produced a {modules}-module symbol "
+            "(<21 == Micro QR, which cv2 cannot decode)"
+        )

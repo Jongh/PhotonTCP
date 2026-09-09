@@ -15,6 +15,7 @@ from .devices import (
     MemoryDisplay,
     memory_device_pair,
 )
+from .peer import PeerResult, run_peer
 
 # The device abstractions, the in-memory fakes, and OpticalChannel are all
 # hardware-free (channel.py imports only numpy / the QR codec / devices, never
@@ -26,6 +27,8 @@ __all__ = [
     "MemoryDisplay",
     "MemoryCamera",
     "memory_device_pair",
+    "run_peer",
+    "PeerResult",
 ]
 
 # The cv2-backed real device adapters are re-exported only when opencv-python is

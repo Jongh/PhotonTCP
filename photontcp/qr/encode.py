@@ -16,6 +16,12 @@ Shared codec contract (see ``docs/milestones/M5.md`` -> "공유 규약"):
   ASCII-safe so a string-returning decoder never corrupts binary data.
 * **EC level**: the error-correction level follows segno's notation and is
   passed through the ``error`` parameter (default ``"m"`` = ~15% recovery).
+* **Symbol type**: always a *regular* QR symbol -- never a Micro QR (M1..M4).
+  segno would otherwise pick a Micro QR automatically for short payloads, and
+  OpenCV's ``cv2.QRCodeDetector`` (the decoder backend this codec ships with)
+  has no Micro-QR support, so such a frame would be undecodable at any scale.
+  Emitting only regular QR is therefore a *codec* invariant, not a tuning knob:
+  it is what makes short payloads (<= 9 raw bytes) round-trip at all.
 
 The encoder is a pure function with no side effects (no file/stdout I/O, no
 global state mutation): given the same input it always returns the same array.
@@ -57,6 +63,13 @@ def encode_frame(
     ourselves keeps the output deterministic and avoids an image-decoding
     dependency.
 
+    The symbol is always a **regular QR code** (``micro=False``). segno would
+    pick a Micro QR (M1..M4) for short payloads, but ``cv2.QRCodeDetector`` --
+    the decoder this codec pairs with -- does not support Micro QR, so such a
+    frame could never be decoded back. ``micro`` is intentionally not exposed
+    as a parameter: an unreadable frame is never a useful option here. The cost
+    is a slightly larger symbol for tiny payloads (version 1 instead of M3/M4).
+
     Args:
         data: Raw payload bytes (e.g. a packed PhotonTCP packet).
         scale: Pixel size of each QR module (each module becomes a
@@ -82,7 +95,12 @@ def encode_frame(
 
     b64 = base64.b64encode(data).decode("ascii")
     try:
-        qr = segno.make(b64, error=error)
+        # micro=False is deliberate and NOT exposed as a parameter: segno
+        # defaults to Micro QR for short payloads, and cv2.QRCodeDetector
+        # cannot decode Micro QR, so a Micro symbol would be a frame the
+        # codec can emit but never read back. Forcing a regular symbol
+        # (version 1+) keeps encode/decode total over all payload sizes.
+        qr = segno.make(b64, error=error, micro=False)
     except segno.DataOverflowError as exc:
         raise QRCapacityError(
             "payload too large for a single QR symbol at error level "
